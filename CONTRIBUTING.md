@@ -4,12 +4,13 @@ Keep changes small, tested, and aligned with the existing style.
 
 ## Getting Started
 
-1. **Fork the repository** on GitHub.
+1. **Fork the official repository** on GitHub: https://github.com/GFcyborg/qasm3-to-qiskit
 2. **Clone your fork** locally and set up the environment:
 
    ```bash
    git clone https://github.com/YOUR-USERNAME/qasm3-to-qiskit.git
    cd qasm3-to-qiskit
+   git remote add upstream https://github.com/GFcyborg/qasm3-to-qiskit.git
    bash setup.sh
    source .venv/bin/activate
    ```

@@ -2,6 +2,8 @@
 
 Desktop tool for testing OpenQASM 3 rewrite compatibility with `qiskit-qasm3-import`, visualizing circuits, and running Aer simulations.
 
+Official repository: https://github.com/GFcyborg/qasm3-to-qiskit
+
 ## What the app does
 
 - Left pane (`QASM original`): editable source text
@@ -31,7 +33,7 @@ If your platform cannot use prebuilt wheels for scientific dependencies, install
 ## Setup (fresh clone)
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/GFcyborg/qasm3-to-qiskit.git
 cd qasm3-to-qiskit
 bash setup.sh
 source .venv/bin/activate
