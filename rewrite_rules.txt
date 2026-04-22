@@ -1,0 +1,58 @@
+QASM3 to Qiskit Rewrite Rules
+==================================================
+
+This file is the single source of truth for the Help -> Rewrite rules dialog.
+Keep this file aligned with transpiler behavior in app.py.
+
+Sync markers (do not remove; used by app.py consistency check):
+- Insert OPENQASM 3.0 header when missing.
+- Expand include "stdgates.inc" into inline compatibility gate definitions.
+- Drop includes other than stdgates.inc.
+- Fold const declarations with statically known values into an environment.
+- Keep only classical declarations whose type is bit or bool.
+- Drop unsupported classical declarations that cannot be folded.
+- Unroll for loops only when range bounds are statically known.
+- Fold branching statements when condition is statically known.
+- Rewrite bit comparisons for qiskit-compatible conditions.
+- Drop calibration grammar/definitions, extern declarations, delays, stretch, and duration statements.
+- Unbox box statements by emitting only their inner body statements.
+- Keep reset, measurement, gate definitions, and quantum gate operations.
+- Substitute compile-time environment values into emitted statements.
+- Normalize uint tokens to int in rewritten output.
+- Strip residual stretch, duration, and delay forms in post-processing.
+
+Header and Includes
+- Adds OPENQASM 3.0; when the input source has no version header.
+- Replaces include "stdgates.inc" with inline compatibility gate definitions used by the qiskit importer.
+- Drops other include statements.
+
+Classical Declarations and Constants
+- Folds constant declarations into a compile-time environment when initializer values are statically known.
+- Keeps only classical declarations of type bit or bool.
+- Drops unsupported classical declarations when they cannot be folded.
+- Rewrites uint tokens to int in output for importer compatibility.
+
+Control Flow
+- Unrolls for loops only when range bounds are statically known.
+- Drops for loops with non-static ranges and records an issue.
+- Folds if/else branches when conditions evaluate to compile-time booleans.
+- Rewrites bit/bool conditions into importer-compatible forms when needed.
+
+Calibration and Timing
+- Removes unsupported calibration and timing constructs, including:
+  defcal grammar declarations, defcal blocks, extern declarations,
+  delay operations, stretch declarations, and duration declarations.
+- Unboxes box blocks by emitting only their body statements.
+
+Quantum Statements
+- Preserves quantum gate definitions.
+- Preserves quantum gate operations, reset statements, and measurement statements.
+- Applies compile-time substitution to emitted quantum statements.
+
+Environment Substitution
+- Replaces compile-time identifiers in expressions and statement text.
+- Simplifies bracketed index expressions when possible.
+
+Fallback Behavior
+- Uses OpenQASM serializer for remaining statement types when possible.
+- Records a rewrite issue when a statement cannot be emitted.

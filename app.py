@@ -1,0 +1,1385 @@
+from __future__ import annotations
+
+import dataclasses
+import math
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import webbrowser
+from dataclasses import dataclass
+from datetime import datetime
+from io import BytesIO
+from pathlib import Path
+from typing import Any, cast
+from urllib.parse import urlparse
+
+import PySide6
+import qiskit_qasm3_import
+from PySide6.QtCore import QObject, QRunnable, QRect, QSize, Qt, QThreadPool, QTimer, Signal
+from PySide6.QtGui import QAction, QColor, QFont, QKeySequence, QPainter, QPixmap, QTextCharFormat, QTextCursor, QTextFormat
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QFileDialog,
+    QGraphicsScene,
+    QGraphicsView,
+    QLabel,
+    QMainWindow,
+    QMenu,
+    QInputDialog,
+    QMessageBox,
+    QLineEdit,
+    QPushButton,
+    QPlainTextEdit,
+    QSplitter,
+    QTextEdit,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QToolTip,
+    QVBoxLayout,
+    QWidget,
+)
+
+from openqasm3 import dumps, parse
+from qiskit import transpile
+from qiskit_aer import AerSimulator
+from qiskit_qasm3_import import parse as qiskit_parse
+from qiskit.visualization import circuit_drawer
+
+
+ROOT = Path(__file__).resolve().parent
+EXAMPLES = ROOT / "examples"
+REPO_URLS = ROOT / "repositories.url"
+REWRITE_RULES_FILE = ROOT / "rewrite_rules.txt"
+REWRITE_RULES_SYNC_MARKERS = (
+    "Insert OPENQASM 3.0 header when missing.",
+    "Expand include \"stdgates.inc\" into inline compatibility gate definitions.",
+    "Drop includes other than stdgates.inc.",
+    "Fold const declarations with statically known values into an environment.",
+    "Keep only classical declarations whose type is bit or bool.",
+    "Drop unsupported classical declarations that cannot be folded.",
+    "Unroll for loops only when range bounds are statically known.",
+    "Fold branching statements when condition is statically known.",
+    "Rewrite bit comparisons for qiskit-compatible conditions.",
+    "Drop calibration grammar/definitions, extern declarations, delays, stretch, and duration statements.",
+    "Unbox box statements by emitting only their inner body statements.",
+    "Keep reset, measurement, gate definitions, and quantum gate operations.",
+    "Substitute compile-time environment values into emitted statements.",
+    "Normalize uint tokens to int in rewritten output.",
+    "Strip residual stretch, duration, and delay forms in post-processing.",
+)
+
+
+@dataclass(slots=True)
+class Issue:
+    start: int
+    end: int
+    kind: str
+    detail: str
+
+
+class AerRunSignals(QObject):
+    finished = Signal(int, object, object, object, object)
+
+
+class AerRunWorker(QRunnable):
+    def __init__(self, token: int, circuit: Any, shots: int = 1024) -> None:
+        super().__init__()
+        self.token = token
+        self.circuit = circuit
+        self.shots = shots
+        self.signals = AerRunSignals()
+
+    def run(self) -> None:
+        run_timestamp = datetime.now()
+        try:
+            counts = run_circuit_counts(self.circuit, self.shots)
+            error = None
+        except Exception as exc:
+            counts = None
+            error = str(exc)
+        self.signals.finished.emit(self.token, self.circuit, counts, error, run_timestamp)
+
+
+def kind(node: Any) -> str:
+    return type(node).__name__
+
+
+def span(node: Any) -> Any:
+    return getattr(node, "span", None)
+
+
+def to_pos(editor: QPlainTextEdit, line: int, column: int) -> int:
+    block = editor.document().findBlockByNumber(max(0, line))
+    if not block.isValid():
+        return max(0, len(editor.toPlainText()))
+    pos = block.position() + max(0, column)
+    return max(0, min(pos, max(0, len(editor.toPlainText()) - 1)))
+
+
+def clamp_cursor_pos(editor: QPlainTextEdit, pos: int) -> int:
+    limit = max(0, len(editor.toPlainText()) - 1)
+    return max(0, min(pos, limit))
+
+
+def eval_text(expr: str, env: dict[str, Any]) -> Any | None:
+    expr = expr.replace("π", "pi")
+    expr = re.sub(r"\btrue\b", "True", expr)
+    expr = re.sub(r"\bfalse\b", "False", expr)
+    expr = expr.replace("&&", " and ").replace("||", " or ")
+    expr = re.sub(r"!\s*(?!=)", " not ", expr)
+    expr = re.sub(r"\bpi\b", "math.pi", expr)
+    expr = re.sub(r"\btau\b", "math.tau", expr)
+    expr = re.sub(r"\beuler_gamma\b", "math.euler_gamma", expr)
+    for name, value in sorted(env.items(), key=lambda item: -len(item[0])):
+        expr = re.sub(rf"\b{name}\b", repr(value), expr)
+    expr = re.sub(r"\b([A-Za-z_]\w*)\[(\d+)\]", r"bit(\1, \2)", expr)
+    try:
+        return eval(expr, {"__builtins__": {}, "math": math, "bit": lambda v, i: (int(v) >> int(i)) & 1, "bool": bool, "int": int, "float": float}, {})
+    except Exception:
+        return None
+
+
+def run_circuit_counts(circuit: Any, shots: int = 1024) -> Any:
+    backend = AerSimulator()
+    if getattr(circuit, "num_parameters", 0):
+        circuit = circuit.assign_parameters({parameter: 0.0 for parameter in circuit.parameters})
+    compiled = transpile(circuit, backend)
+    result = backend.run(compiled, shots=shots).result()
+    return result.get_counts()
+
+
+def subst_env(text: str, env: dict[str, Any]) -> str:
+    for name, value in sorted(env.items(), key=lambda item: -len(item[0])):
+        text = re.sub(rf"\b{name}\b", str(value), text)
+    def simplify(match: re.Match[str]) -> str:
+        inner = match.group(1)
+        value = eval_text(inner, env)
+        return f"[{value}]" if value is not None else match.group(0)
+
+    return re.sub(r"\[([^\[\]]+)\]", simplify, text)
+
+
+def stdgates_compat_lines() -> list[str]:
+    return [
+        'gate p(lambda) a { U(0, 0, lambda) a; }',
+        'gate phase(lambda) q { U(0, 0, lambda) q; }',
+        'gate x a { U(pi, 0, pi) a; }',
+        'gate y a { U(pi, pi/2, pi/2) a; }',
+        'gate z a { U(0, 0, pi) a; }',
+        'gate h a { U(pi/2, 0, pi) a; }',
+        'gate s a { U(0, 0, pi/2) a; }',
+        'gate sdg a { U(0, 0, -pi/2) a; }',
+        'gate t a { U(0, 0, pi/4) a; }',
+        'gate tdg a { U(0, 0, -pi/4) a; }',
+        'gate sx a { U(pi/2, -pi/2, pi/2) a; }',
+        'gate rx(theta) a { U(theta, -pi/2, pi/2) a; }',
+        'gate ry(theta) a { U(theta, 0, 0) a; }',
+        'gate rz(lambda) a { U(0, 0, lambda) a; }',
+        'gate u1(lambda) q { U(0, 0, lambda) q; }',
+        'gate u2(phi, lambda) q { U(pi/2, phi, lambda) q; }',
+        'gate u3(theta, phi, lambda) q { U(theta, phi, lambda) q; }',
+        'gate id a { U(0, 0, 0) a; }',
+        'gate cx a, b { ctrl @ x a, b; }',
+        'gate cy a, b { ctrl @ y a, b; }',
+        'gate cz a, b { ctrl @ z a, b; }',
+        'gate cp(lambda) a, b { ctrl @ p(lambda) a, b; }',
+        'gate cphase(lambda) a, b { ctrl @ p(lambda) a, b; }',
+        'gate crx(theta) a, b { ctrl @ rx(theta) a, b; }',
+        'gate cry(theta) a, b { ctrl @ ry(theta) a, b; }',
+        'gate crz(lambda) a, b { ctrl @ rz(lambda) a, b; }',
+        'gate ch a, b { ctrl @ h a, b; }',
+        'gate swap a, b { cx a, b; cx b, a; cx a, b; }',
+        'gate ccx a, b, c { ctrl @ ctrl @ x a, b, c; }',
+        'gate cswap a, b, c { ctrl @ swap a, b, c; }',
+        'gate cu(theta, phi, lambda, gamma) a, b { p(gamma - theta / 2) a; ctrl @ U(theta, phi, lambda) a, b; }',
+    ]
+
+
+def eval_node(node: Any, env: dict[str, Any]) -> Any | None:
+    k = kind(node)
+    if k == "IntegerLiteral":
+        return int(getattr(node, "value", 0))
+    if k == "FloatLiteral":
+        return float(getattr(node, "value", 0.0))
+    if k == "BooleanLiteral":
+        return str(getattr(node, "value", "false")).lower() == "true"
+    if k == "Identifier":
+        return env.get(getattr(node, "name", ""))
+    if k == "IndexExpression":
+        base = eval_node(getattr(node, "collection", None), env)
+        if base is None:
+            return None
+        indices = getattr(node, "index", [])
+        if isinstance(base, int):
+            value = base
+            for index in indices:
+                resolved = eval_node(index, env)
+                if resolved is None:
+                    return None
+                value = (int(value) >> int(resolved)) & 1
+            return value
+        value = base
+        for index in indices:
+            resolved = eval_node(index, env)
+            if resolved is None:
+                return None
+            value = value[int(resolved)]
+        return value
+    if k == "Cast":
+        value = eval_node(getattr(node, "argument", None), env)
+        if value is None:
+            return None
+        target = kind(getattr(node, "type", None))
+        if target == "BoolType":
+            return bool(value)
+        if target in {"IntType", "UintType", "BitType"}:
+            return int(value)
+        if target == "FloatType":
+            return float(value)
+    if k == "UnaryExpression":
+        value = eval_node(getattr(node, "expression", None), env)
+        op = getattr(node, "op", None)
+        if value is None:
+            return None
+        if op == "-":
+            return -value
+        if op == "+":
+            return +value
+        if op == "!":
+            return not bool(value)
+        if op == "~":
+            return ~int(value)
+    if k == "BinaryExpression":
+        left = eval_node(getattr(node, "lhs", None), env)
+        right = eval_node(getattr(node, "rhs", None), env)
+        op = getattr(node, "op", None)
+        if left is None or right is None:
+            return None
+        match op:
+            case "+":
+                return left + right
+            case "-":
+                return left - right
+            case "*":
+                return left * right
+            case "/":
+                return left / right
+            case "%":
+                return left % right
+            case "**":
+                return left ** right
+            case "<":
+                return left < right
+            case "<=":
+                return left <= right
+            case ">":
+                return left > right
+            case ">=":
+                return left >= right
+            case "==":
+                return left == right
+            case "!=":
+                return left != right
+            case "&&":
+                return bool(left) and bool(right)
+            case "||":
+                return bool(left) or bool(right)
+            case "&":
+                return int(left) & int(right)
+            case "|":
+                return int(left) | int(right)
+            case "^":
+                return int(left) ^ int(right)
+            case "<<":
+                return int(left) << int(right)
+            case ">>":
+                return int(left) >> int(right)
+    try:
+        return eval_text(dumps(node).strip().rstrip(";"), env)
+    except Exception:
+        return None
+
+
+def range_values(node: Any, env: dict[str, Any]) -> list[int] | None:
+    start = eval_node(getattr(node, "start", None), env)
+    end = eval_node(getattr(node, "end", None), env)
+    step = eval_node(getattr(node, "step", None), env) if getattr(node, "step", None) is not None else None
+    if start is None or end is None:
+        return None
+    start = int(start)
+    end = int(end)
+    step = int(step) if step is not None else (1 if start <= end else -1)
+    if step == 0:
+        return None
+    values: list[int] = []
+    current = start
+    if step > 0:
+        while current <= end:
+            values.append(current)
+            current += step
+    else:
+        while current >= end:
+            values.append(current)
+            current += step
+    return values
+
+
+def rewrite_condition_text(expr: Any, env: dict[str, Any]) -> str | None:
+    if eval_node(expr, env) is not None:
+        value = eval_node(expr, env)
+        if isinstance(value, bool):
+            return "true" if value else "false"
+    
+    # Check if this is a comparison of a simple identifier to a boolean value
+    # (single bit vs bit array)
+    k = kind(expr)
+    if k == "BinaryExpression":
+        op = getattr(expr, "op", None)
+        op_name = getattr(op, "name", None) if hasattr(op, "name") else str(op)
+        if op_name == "==":
+            lhs = getattr(expr, "lhs", None)
+            rhs = getattr(expr, "rhs", None)
+            lhs_k = kind(lhs)
+            rhs_k = kind(rhs)
+            
+            # For simple identifier == constant patterns
+            if lhs_k == "Identifier" and rhs_k == "IntegerLiteral":
+                ident_name = getattr(lhs, "name", "")
+                rhs_value = getattr(rhs, "value", None)
+                if ident_name and rhs_value is not None:
+                    # Single bit == 1 should become == true
+                    if rhs_value == 1:
+                        return f"{ident_name} == true"
+                    # Single bit == 0 should become == false
+                    if rhs_value == 0:
+                        return f"{ident_name} == false"
+    
+    text = subst_env(dumps(expr).strip().rstrip(";"), env)
+    text = re.sub(r"\b(?:int|uint|bool|float|bit)\b(?:\[\d+\])?\s*\(([^)]+)\)", r"\1", text)
+    if re.fullmatch(r"[A-Za-z_]\w*", text):
+        return f"{text} == true"
+    if re.fullmatch(r"![A-Za-z_]\w*", text):
+        return f"{text[1:]} == false"
+    text = re.sub(r"^\(?\s*([A-Za-z_]\w*)\s*==\s*0\s*\)?$", r"\1 == false", text)
+    text = re.sub(r"^\(?\s*(.+?)\s*==\s*0\s*\)?$", r"\1 == false", text)
+    return text
+
+
+def is_supported_decl(stmt: Any) -> bool:
+    tname = kind(getattr(stmt, "type", None))
+    return tname in {"BitType", "BoolType"}
+
+
+def emit_stmt(stmt: Any, env: dict[str, Any], issues: list[Issue], indent: int = 0) -> list[str]:
+    pad = "  " * indent
+    k = kind(stmt)
+    if k == "Include":
+        name = getattr(stmt, "filename", "")
+        if Path(name).name == "stdgates.inc":
+            return [pad + line for line in stdgates_compat_lines()]
+        return []
+    if k == "ConstantDeclaration":
+        name = getattr(getattr(stmt, "identifier", None), "name", "")
+        value = eval_node(getattr(stmt, "init_expression", None), env)
+        if value is not None:
+            env[name] = value
+            return []
+        issues.append(Issue(stmt.span.start_line, stmt.span.end_line, k.lower(), f"cannot fold constant {name}"))
+        return []
+    if k == "ClassicalDeclaration":
+        if is_supported_decl(stmt):
+            return [pad + dumps(stmt).strip()]
+        name = getattr(getattr(stmt, "identifier", None), "name", "")
+        value = eval_node(getattr(stmt, "init_expression", None), env)
+        if value is not None:
+            env[name] = value
+            return []
+        issues.append(Issue(stmt.span.start_line, stmt.span.end_line, k.lower(), f"drop unsupported declaration {name}"))
+        return []
+    if k == "ForInLoop":
+        values = range_values(getattr(stmt, "set_declaration", None), env)
+        if values is None:
+            issues.append(Issue(stmt.span.start_line, stmt.span.end_line, k.lower(), "loop range is not statically known"))
+            return []
+        out: list[str] = []
+        ident = getattr(getattr(stmt, "identifier", None), "name", "")
+        for value in values:
+            next_env = dict(env)
+            next_env[ident] = value
+            for inner in getattr(stmt, "block", []):
+                out.extend(emit_stmt(inner, next_env, issues, indent))
+        return out
+    if k == "BranchingStatement":
+        cond_value = eval_node(getattr(stmt, "condition", None), env)
+        if isinstance(cond_value, bool):
+            block = getattr(stmt, "if_block" if cond_value else "else_block", [])
+            out: list[str] = []
+            for inner in block:
+                out.extend(emit_stmt(inner, env, issues, indent))
+            return out
+        cond_text = rewrite_condition_text(getattr(stmt, "condition", None), env)
+        if cond_text is None:
+            issues.append(Issue(stmt.span.start_line, stmt.span.end_line, k.lower(), "condition cannot be rewritten for qiskit"))
+            return []
+        cond_text = subst_env(cond_text, env)
+        out = [pad + f"if ({cond_text}) {{"]
+        for inner in getattr(stmt, "if_block", []):
+            out.extend(emit_stmt(inner, env, issues, indent + 1))
+        if getattr(stmt, "else_block", []):
+            out.append(pad + "} else {")
+            for inner in getattr(stmt, "else_block", []):
+                out.extend(emit_stmt(inner, env, issues, indent + 1))
+        out.append(pad + "}")
+        return out
+    if k == "Box":
+        out: list[str] = []
+        for inner in getattr(stmt, "body", []):
+            out.extend(emit_stmt(inner, env, issues, indent))
+        return out
+    if k in {"CalibrationGrammarDeclaration", "CalibrationDefinition", "ExternDeclaration", "QuantumDelay", "StretchDeclaration", "DurationDeclaration"}:
+        issues.append(Issue(stmt.span.start_line, stmt.span.end_line, k.lower(), "not supported by qiskit importer"))
+        return []
+    if k == "QuantumReset":
+        return [pad + subst_env(dumps(stmt).strip(), env)]
+    if k == "QuantumMeasurementStatement":
+        return [pad + subst_env(dumps(stmt).strip(), env)]
+    if k == "QuantumGate":
+        text = subst_env(dumps(stmt).strip(), env)
+        if re.match(r"^u\b", text):
+            text = re.sub(r"^u\b", "U(0, 0, 0)", text)
+        return [pad + text]
+    if k == "QuantumGateDefinition":
+        return [pad + dumps(stmt).strip()]
+    if k in {"Program", "StatementOrScope"}:
+        out: list[str] = []
+        for inner in getattr(stmt, "statements", getattr(stmt, "block", [])):
+            out.extend(emit_stmt(inner, env, issues, indent))
+        return out
+    if k == "Annotation":
+        return []
+    try:
+        return [pad + subst_env(dumps(stmt).strip(), env)]
+    except Exception:
+        issues.append(Issue(stmt.span.start_line, stmt.span.end_line, k.lower(), "cannot emit statement"))
+        return []
+
+
+def transpile_qasm(source: str) -> tuple[str, list[Issue], Any | None]:
+    program = parse(source)
+    env: dict[str, Any] = {}
+    issues: list[Issue] = []
+    lines: list[str] = []
+    if not source.lstrip().startswith("OPENQASM"):
+        lines.append("OPENQASM 3.0;")
+    for stmt in program.statements:
+        lines.extend(emit_stmt(stmt, env, issues, 0))
+    rewritten = "\n".join(line for line in lines if line.strip()) + "\n"
+    rewritten = re.sub(r"\buint\b", "int", rewritten)
+    rewritten = re.sub(r"\bstretch\s+\w+;\n?", "", rewritten)
+    rewritten = re.sub(r"\bduration\s+\w+\s*=.*?;\n?", "", rewritten)
+    rewritten = re.sub(r"\bdelay\[[^\]]+\]\s+[^;]+;\n?", "", rewritten)
+    return rewritten, issues, program
+
+
+def node_iter(node: Any):
+    if not dataclasses.is_dataclass(node):
+        return
+    for field in dataclasses.fields(node):
+        value = getattr(node, field.name)
+        if isinstance(value, list):
+            for child in value:
+                if dataclasses.is_dataclass(child):
+                    yield child
+                    yield from node_iter(child)
+        elif dataclasses.is_dataclass(value):
+            yield value
+            yield from node_iter(value)
+
+
+def make_tree(program: Any) -> QTreeWidgetItem:
+    root = QTreeWidgetItem(["Program"])
+    root.setData(0, Qt.ItemDataRole.UserRole, program)
+
+    def add(parent: QTreeWidgetItem, node: Any) -> None:
+        label = kind(node)
+        if kind(node) == "Identifier":
+            label = f"Identifier: {getattr(node, 'name', '')}"
+        elif kind(node) in {"QuantumGateDefinition", "QuantumGate", "ClassicalDeclaration", "ConstantDeclaration", "QubitDeclaration", "ForInLoop", "BranchingStatement"}:
+            label = f"{kind(node)}: {getattr(getattr(node, 'identifier', None), 'name', getattr(getattr(node, 'name', None), 'name', ''))}"
+        item = QTreeWidgetItem([label])
+        item.setData(0, Qt.ItemDataRole.UserRole, node)
+        parent.addChild(item)
+        for child in node_iter(node):
+            add(item, child)
+
+    for stmt in getattr(program, "statements", []):
+        add(root, stmt)
+    return root
+
+
+def span_offsets(editor: QPlainTextEdit, node: Any) -> tuple[int, int] | None:
+    s = span(node)
+    if not s:
+        return None
+    # Spans use 1-indexed line numbers, convert to 0-indexed for to_pos
+    start = to_pos(editor, s.start_line - 1, s.start_column)
+    end = clamp_cursor_pos(editor, to_pos(editor, s.end_line - 1, s.end_column + 1))
+    return start, end
+
+
+def mark_unsupported(program: Any, editor: QPlainTextEdit) -> list[tuple[int, int, str]]:
+    spans: list[tuple[int, int, str]] = []
+
+    def add_span(node: Any, reason: str) -> None:
+        off = span_offsets(editor, node)
+        if off:
+            spans.append((off[0], off[1], reason))
+
+    def walk(node: Any) -> None:
+        if not dataclasses.is_dataclass(node):
+            return
+        name = kind(node)
+        if name in {"ConstantDeclaration", "ExternDeclaration", "CalibrationGrammarDeclaration", "CalibrationDefinition", "QuantumDelay", "Box"}:
+            reason_map = {
+                "ConstantDeclaration": "Folded away during rewrite because constants are resolved at compile time.",
+                "ExternDeclaration": "Removed because extern declarations are not supported by the qiskit importer.",
+                "CalibrationGrammarDeclaration": "Removed because calibration grammar is not supported by the qiskit importer.",
+                "CalibrationDefinition": "Removed because calibration definitions are not supported by the qiskit importer.",
+                "QuantumDelay": "Removed because delay operations are not supported by the qiskit importer.",
+                "Box": "Unboxed during rewrite; only inner statements are kept.",
+            }
+            add_span(node, reason_map.get(name, "Rewritten for compatibility."))
+        if name == "ClassicalDeclaration" and kind(getattr(node, "type", None)) in {"IntType", "UintType", "FloatType", "ArrayType", "StretchType", "DurationType"}:
+            add_span(node, "Unsupported classical type for importer; declaration is dropped unless it can be folded.")
+        if name == "ForInLoop" and range_values(getattr(node, "set_declaration", None), {}) is None:
+            add_span(node, "Loop cannot be unrolled because range bounds are not statically known.")
+        if name == "BranchingStatement" and rewrite_condition_text(getattr(node, "condition", None), {}) is None and eval_node(getattr(node, "condition", None), {}) is None:
+            add_span(node, "Condition cannot be rewritten into qiskit-compatible form.")
+        for child in node_iter(node):
+            walk(child)
+
+    walk(program)
+    return spans
+
+
+def mark_includes(program: Any, editor: QPlainTextEdit) -> list[tuple[int, int, str]]:
+    """Mark include statements with a special type for dark-gray linking."""
+    spans: list[tuple[int, int, str]] = []
+
+    def walk(node: Any) -> None:
+        if not dataclasses.is_dataclass(node):
+            return
+        name = kind(node)
+        if name == "Include":
+            filename = getattr(node, "filename", "")
+            off = span_offsets(editor, node)
+            if off:
+                spans.append((off[0], off[1], f"include:{filename}"))
+        for child in node_iter(node):
+            walk(child)
+
+    walk(program)
+    return spans
+
+
+class LineNumberArea(QWidget):
+    def __init__(self, editor: "CodeEditor") -> None:
+        super().__init__(editor)
+        self.editor = editor
+
+    def sizeHint(self) -> QSize:
+        return QSize(self.editor.line_number_area_width(), 0)
+
+    def paintEvent(self, event: Any) -> None:
+        self.editor.paint_line_numbers(event)
+
+
+class CodeEditor(QPlainTextEdit):
+    def __init__(self) -> None:
+        super().__init__()
+        self.line_number_area = LineNumberArea(self)
+        self._issue_ranges: list[tuple[int, int, str]] = []
+        self._include_ranges: list[tuple[int, int, str]] = []
+        self._hovered_issue_index: int | None = None
+        self.blockCountChanged.connect(self.update_line_number_area_width)
+        self.updateRequest.connect(self.update_line_number_area)
+        self.cursorPositionChanged.connect(self.highlight_current_line)
+        self.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.setMouseTracking(True)
+        self.update_line_number_area_width(0)
+
+    def line_number_area_width(self) -> int:
+        digits = len(str(max(1, self.blockCount())))
+        return 10 + self.fontMetrics().horizontalAdvance("9") * digits
+
+    def update_line_number_area_width(self, _: int) -> None:
+        self.setViewportMargins(self.line_number_area_width(), 0, 0, 0)
+
+    def update_line_number_area(self, rect: QRect, dy: int) -> None:
+        if dy:
+            self.line_number_area.scroll(0, dy)
+        else:
+            self.line_number_area.update(0, rect.y(), self.line_number_area.width(), rect.height())
+        if rect.contains(self.viewport().rect()):
+            self.update_line_number_area_width(0)
+
+    def resizeEvent(self, event: Any) -> None:
+        super().resizeEvent(event)
+        cr = self.contentsRect()
+        self.line_number_area.setGeometry(QRect(cr.left(), cr.top(), self.line_number_area_width(), cr.height()))
+
+    def paint_line_numbers(self, event: Any) -> None:
+        painter = QPainter(self.line_number_area)
+        painter.fillRect(event.rect(), QColor("#1f1f1f"))
+        block = self.firstVisibleBlock()
+        number = block.blockNumber()
+        top = int(self.blockBoundingGeometry(block).translated(self.contentOffset()).top())
+        bottom = top + int(self.blockBoundingRect(block).height())
+        while block.isValid() and top <= event.rect().bottom():
+            if block.isVisible() and bottom >= event.rect().top():
+                painter.setPen(QColor("#808080"))
+                painter.drawText(0, top, self.line_number_area.width() - 4, self.fontMetrics().height(), Qt.AlignmentFlag.AlignRight, str(number + 1))
+            block = block.next()
+            top = bottom
+            bottom = top + int(self.blockBoundingRect(block).height())
+            number += 1
+
+    def highlight_current_line(self) -> None:
+        extra = []
+        if not self.isReadOnly():
+            selection = cast(Any, QTextEdit).ExtraSelection()
+            selection.format.setBackground(QColor("#fff9c4"))
+            selection.format.setProperty(QTextFormat.Property.FullWidthSelection, True)
+            selection.cursor = self.textCursor()
+            selection.cursor.clearSelection()
+            extra.append(selection)
+        for start, end, _ in self._include_ranges:
+            start = clamp_cursor_pos(self, start)
+            end = clamp_cursor_pos(self, end)
+            if end < start:
+                continue
+            selection = cast(Any, QTextEdit).ExtraSelection()
+            selection.format.setBackground(QColor("#e0e0e0"))
+            selection.format.setForeground(QColor("#303030"))
+            cursor = self.textCursor()
+            cursor.setPosition(start)
+            cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+            selection.cursor = cursor
+            extra.append(selection)
+        for start, end, _ in self._issue_ranges:
+            start = clamp_cursor_pos(self, start)
+            end = clamp_cursor_pos(self, end)
+            if end < start:
+                continue
+            selection = cast(Any, QTextEdit).ExtraSelection()
+            selection.format.setBackground(QColor("#dcedc8"))
+            selection.format.setForeground(QColor("#1b1b1b"))
+            cursor = self.textCursor()
+            cursor.setPosition(start)
+            cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+            selection.cursor = cursor
+            extra.append(selection)
+        self.setExtraSelections(extra)
+
+    def issue_index_at_position(self, pos: int) -> int | None:
+        for i, (start, end, _) in enumerate(self._issue_ranges):
+            if start <= pos <= end:
+                return i
+        return None
+
+    def include_index_at_position(self, pos: int) -> int | None:
+        for i, (start, end, _) in enumerate(self._include_ranges):
+            if start <= pos <= end:
+                return i
+        return None
+
+    def mouseMoveEvent(self, event: Any) -> None:
+        pos = self.cursorForPosition(event.position().toPoint()).position()
+        issue_index = self.issue_index_at_position(pos)
+        include_index = self.include_index_at_position(pos) if issue_index is None else None
+        
+        if issue_index is None and include_index is None:
+            if self._hovered_issue_index is not None:
+                QToolTip.hideText()
+                self._hovered_issue_index = None
+            super().mouseMoveEvent(event)
+            return
+
+        if issue_index is not None and issue_index != self._hovered_issue_index:
+            reason = self._issue_ranges[issue_index][2]
+            QToolTip.showText(event.globalPosition().toPoint(), reason, self)
+            self._hovered_issue_index = issue_index
+        elif include_index is not None and include_index != self._hovered_issue_index:
+            filename = self._include_ranges[include_index][2].split(":", 1)[1]
+            QToolTip.showText(event.globalPosition().toPoint(), f"Include: {filename}\n(expanded in right pane)", self)
+            self._hovered_issue_index = include_index
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event: Any) -> None:
+        QToolTip.hideText()
+        self._hovered_issue_index = None
+        super().leaveEvent(event)
+
+    def set_issue_spans(self, ranges: list[tuple[int, int, str]]) -> None:
+        self._issue_ranges = ranges
+        self._hovered_issue_index = None
+        QToolTip.hideText()
+        self.highlight_current_line()
+
+    def set_include_spans(self, ranges: list[tuple[int, int, str]]) -> None:
+        self._include_ranges = ranges
+        self._hovered_issue_index = None
+        QToolTip.hideText()
+        self.highlight_current_line()
+
+
+class CircuitView(QGraphicsView):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setScene(QGraphicsScene(self))
+        self.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        self._dragging = False
+        self._drag_start_pos: tuple[int, int] | None = None
+        self._scroll_bar_start: tuple[int, int] | None = None
+        self.show_placeholder()
+
+    def create_placeholder_pixmap(self, width: int = 400, height: int = 300) -> QPixmap:
+        """Create a placeholder pixmap with a crossed X icon."""
+        pixmap = QPixmap(width, height)
+        pixmap.fill(QColor("#f5f5f5"))
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QColor("#cccccc"))
+        painter.drawRect(0, 0, width - 1, height - 1)
+        
+        pen = painter.pen()
+        pen.setWidth(3)
+        pen.setColor(QColor("#dddddd"))
+        painter.setPen(pen)
+        painter.drawLine(int(width * 0.2), int(height * 0.2), int(width * 0.8), int(height * 0.8))
+        painter.drawLine(int(width * 0.8), int(height * 0.2), int(width * 0.2), int(height * 0.8))
+        painter.end()
+        return pixmap
+
+    def show_placeholder(self) -> None:
+        """Display a placeholder when no circuit is available."""
+        self.scene().clear()
+        placeholder = self.create_placeholder_pixmap(self.width() or 400, self.height() or 300)
+        self.scene().addPixmap(placeholder)
+        self.fitInView(self.scene().itemsBoundingRect(), Qt.AspectRatioMode.KeepAspectRatio)
+
+    def set_image(self, image_bytes: bytes) -> None:
+        self.scene().clear()
+        pixmap = QPixmap()
+        if not pixmap.loadFromData(image_bytes):
+            self.show_placeholder()
+            return
+        self.scene().addPixmap(pixmap)
+        self.fitInView(self.scene().itemsBoundingRect(), Qt.AspectRatioMode.KeepAspectRatio)
+
+    def mousePressEvent(self, event: Any) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = True
+            pos = event.position().toPoint()
+            self._drag_start_pos = (pos.x(), pos.y())
+            self._scroll_bar_start = (
+                self.horizontalScrollBar().value(),
+                self.verticalScrollBar().value()
+            )
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: Any) -> None:
+        if self._dragging and self._drag_start_pos and self._scroll_bar_start:
+            pos = event.position().toPoint()
+            dx = pos.x() - self._drag_start_pos[0]
+            dy = pos.y() - self._drag_start_pos[1]
+            self.horizontalScrollBar().setValue(self._scroll_bar_start[0] - dx)
+            self.verticalScrollBar().setValue(self._scroll_bar_start[1] - dy)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: Any) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = False
+            self._drag_start_pos = None
+            self._scroll_bar_start = None
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+        super().mouseReleaseEvent(event)
+
+    def wheelEvent(self, event: Any) -> None:
+        factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+        self.scale(factor, factor)
+
+    def contextMenuEvent(self, event: Any) -> None:
+        menu = QMenu(self)
+        menu.addAction("Reset zoom", lambda: self.fitInView(self.scene().itemsBoundingRect(), Qt.AspectRatioMode.KeepAspectRatio))
+        menu.exec(event.globalPos())
+
+
+class RulesDialog(QDialog):
+    def __init__(self, text: str, parent: QWidget | None = None, title: str = "Rewrite rules") -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(900, 600)
+        layout = QVBoxLayout(self)
+        box = QTextEdit()
+        box.setReadOnly(True)
+        box.setPlainText(text)
+        layout.addWidget(box)
+        close = QPushButton("Close")
+        close.clicked.connect(self.accept)
+        layout.addWidget(close)
+
+
+class MainWindow(QMainWindow):
+    def make_titled_panel(self, title: str, color: str, content: QWidget) -> tuple[QWidget, QLabel]:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        title_bar = QLabel(title)
+        title_bar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title_bar.setFixedHeight(24)
+        title_bar.setStyleSheet(
+            f"background-color: {color}; color: #111111; font-weight: 600; "
+            "border-bottom: 1px solid #888888;"
+        )
+
+        layout.addWidget(title_bar)
+        layout.addWidget(content)
+        return panel, title_bar
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.base_title = "QASM3 Aer Lab"
+        self.setWindowTitle(self.base_title)
+        self._syncing = False
+        self._aer_run_token = 0
+        self._thread_pool = QThreadPool.globalInstance()
+        self.current_program: Any | None = None
+        self.font_size = 10
+
+        self.editor = CodeEditor()
+        self.editor.textChanged.connect(self.debounced_refresh)
+        self.editor.cursorPositionChanged.connect(self.sync_tree_from_cursor)
+        self.tree = QTreeWidget()
+        self.tree.setHeaderHidden(True)
+        self.tree.itemSelectionChanged.connect(self.sync_editor_from_tree)
+        self.output = QPlainTextEdit()
+        self.output.setReadOnly(True)
+        self.circuit = CircuitView()
+        self.circuit_info = QPlainTextEdit()
+        self.circuit_info.setReadOnly(True)
+
+        circuit_panel = QSplitter(Qt.Orientation.Vertical)
+        circuit_panel.addWidget(self.circuit)
+        circuit_panel.addWidget(self.circuit_info)
+        circuit_panel.setStretchFactor(0, 4)
+        circuit_panel.setStretchFactor(1, 1)
+        circuit_panel.setSizes([300, 80])
+
+        top = QSplitter(Qt.Orientation.Horizontal)
+        editor_panel, _ = self.make_titled_panel("QASM original", "#d8ecff", self.editor)
+        output_panel, self.output_title = self.make_titled_panel("Qiskit importer", "#ffe7c2", self.output)
+        top.addWidget(editor_panel)
+        top.addWidget(output_panel)
+        bottom = QSplitter(Qt.Orientation.Horizontal)
+        tree_panel, _ = self.make_titled_panel("AST parse-tree", "#d9f3d6", self.tree)
+        circuit_panel_titled, _ = self.make_titled_panel("Qiskit AER runtime", "#ffd9d9", circuit_panel)
+        bottom.addWidget(tree_panel)
+        bottom.addWidget(circuit_panel_titled)
+        root = QSplitter(Qt.Orientation.Vertical)
+        root.addWidget(top)
+        root.addWidget(bottom)
+        root.setStretchFactor(0, 3)
+        root.setStretchFactor(1, 2)
+        top.setStretchFactor(0, 3)
+        top.setStretchFactor(1, 2)
+        bottom.setStretchFactor(0, 2)
+        bottom.setStretchFactor(1, 3)
+        self.setCentralWidget(root)
+
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(120)
+        self._timer.timeout.connect(self.refresh_views)
+
+        self.build_menu()
+        self.apply_font()
+        self.load_default()
+
+    def build_menu(self) -> None:
+        file_menu = self.menuBar().addMenu("File")
+        open_action = QAction("Open...", self)
+        open_action.triggered.connect(self.open_file)
+        file_menu.addAction(open_action)
+        examples_menu = file_menu.addMenu("Examples")
+        for path in sorted(EXAMPLES.glob("*.qasm")) + sorted(EXAMPLES.glob("*.inc")):
+            action = QAction(path.name, self)
+            action.triggered.connect(lambda _=False, p=path: self.load_path(p))
+            examples_menu.addAction(action)
+        quit_action = QAction("Quit", self)
+        quit_action.setShortcut(QKeySequence.StandardKey.Quit)
+        quit_action.triggered.connect(self.close)
+        file_menu.addAction(quit_action)
+
+        run_menu = self.menuBar().addMenu("Run")
+        run_action = QAction("Run manually (w/ params)", self)
+        run_action.setShortcut("Ctrl+R")
+        run_action.triggered.connect(self.run_current)
+        run_menu.addAction(run_action)
+        rewrite_action = QAction("Apply rewrite to source", self)
+        rewrite_action.setShortcut("Ctrl+E")
+        rewrite_action.setStatusTip("Replace QASM original with the rewritten importer-compatible text")
+        rewrite_action.triggered.connect(self.rewrite_current)
+        run_menu.addAction(rewrite_action)
+        diag_action = QAction("Diagnostics", self)
+        diag_action.setShortcut("Ctrl+D")
+        diag_action.triggered.connect(self.show_diagnostics)
+        run_menu.addAction(diag_action)
+
+        view_menu = self.menuBar().addMenu("View")
+        zoom_in = QAction("Zoom in", self)
+        zoom_in.setShortcut(QKeySequence.StandardKey.ZoomIn)
+        zoom_in.triggered.connect(lambda: self.set_font_size(self.font_size + 1))
+        view_menu.addAction(zoom_in)
+        zoom_out = QAction("Zoom out", self)
+        zoom_out.setShortcut(QKeySequence.StandardKey.ZoomOut)
+        zoom_out.triggered.connect(lambda: self.set_font_size(max(7, self.font_size - 1)))
+        view_menu.addAction(zoom_out)
+        reset_font = QAction("Reset font", self)
+        reset_font.triggered.connect(lambda: self.set_font_size(10))
+        view_menu.addAction(reset_font)
+
+        help_menu = self.menuBar().addMenu("Help")
+        rules_action = QAction("Rewrite rules", self)
+        rules_action.triggered.connect(self.show_rules)
+        help_menu.addAction(rules_action)
+        links = self.repository_links()
+        for label, url in links:
+            if url.endswith("/gpl-3.0.en.html"):
+                license_action = QAction("License", self)
+                license_action.triggered.connect(lambda _=False, u=url: webbrowser.open(u, new=2))
+                help_menu.addAction(license_action)
+                break
+        repos_menu = help_menu.addMenu("Repositories")
+        for label, url in links:
+            if url.endswith("/gpl-3.0.en.html"):
+                continue
+            action = QAction(label, self)
+            action.triggered.connect(lambda _=False, u=url: webbrowser.open(u, new=2))
+            repos_menu.addAction(action)
+
+    def repository_links(self) -> list[tuple[str, str]]:
+        links: list[tuple[str, str]] = []
+        if not REPO_URLS.exists():
+            return links
+        for raw in REPO_URLS.read_text().splitlines():
+            url = raw.strip()
+            if not url or url.startswith("#"):
+                continue
+            path = urlparse(url).path.rstrip("/")
+            tail = path.split("/")[-1] if path else url
+            tail = tail.removesuffix(".git")
+            links.append((tail.capitalize(), url))
+        return links
+
+    def apply_font(self) -> None:
+        font = QFont("DejaVu Sans Mono", self.font_size)
+        for widget in (self.editor, self.output, self.tree, self.circuit_info):
+            widget.setFont(font)
+
+    def set_font_size(self, size: int) -> None:
+        self.font_size = size
+        self.apply_font()
+
+    def load_default(self) -> None:
+        default = EXAMPLES / "adder.qasm"
+        if default.exists():
+            self.load_path(default)
+
+    def open_file(self) -> None:
+        name, _ = QFileDialog.getOpenFileName(self, "Open QASM", str(EXAMPLES), "QASM files (*.qasm *.inc);;All files (*)")
+        if name:
+            self.load_path(Path(name))
+
+    def load_path(self, path: Path) -> None:
+        self._syncing = True
+        try:
+            self.editor.setPlainText(path.read_text())
+            self.setWindowTitle(f"{self.base_title} - {path.resolve()}")
+            self.statusBar().showMessage(f"Loaded {path}")
+        finally:
+            self._syncing = False
+        self.refresh_views()
+
+    def debounced_refresh(self) -> None:
+        if not self._syncing:
+            self._timer.start()
+
+    def refresh_views(self) -> None:
+        source = self.editor.toPlainText()
+        try:
+            rewritten, issues, program = transpile_qasm(source)
+        except Exception as exc:
+            self.current_program = None
+            self.tree.clear()
+            self.circuit.show_placeholder()
+            self.circuit_info.clear()
+            self.editor.set_issue_spans([])
+            self.set_importer_output(None, f"Parse error: {exc}", issues=[])
+            return
+        self.current_program = program
+        qiskit_error = ""
+        circuit = None
+        try:
+            circuit = qiskit_parse(rewritten)
+        except Exception as exc:
+            qiskit_error = str(exc)
+        self.set_importer_output(rewritten, qiskit_error, circuit is not None, issues)
+        self.tree.clear()
+        if program is not None:
+            self.tree.addTopLevelItem(make_tree(program))
+            self.tree.expandToDepth(2)
+        self.editor.set_issue_spans(mark_unsupported(program, self.editor) if program else [])
+        self.editor.set_include_spans(mark_includes(program, self.editor) if program else [])
+        if circuit is not None:
+            self.draw_circuit(circuit)
+            if getattr(circuit, "num_parameters", 0):
+                self.set_circuit_info(
+                    circuit,
+                    run_status='Automatic runs use default parameter values (0.0). Use menu-item "Run manually (w/ params)" to enter values.',
+                )
+            else:
+                self.set_circuit_info(circuit, run_status="Running simulation...")
+                self.start_aer_run(circuit)
+        else:
+            self.circuit.show_placeholder()
+            self.circuit_info.clear()
+
+    def set_importer_output(self, rewritten: str | None, error: str = "", success: bool = True, issues: list[Issue] | None = None) -> None:
+        self.output.clear()
+        cursor = self.output.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.Start)
+        
+        if rewritten is None:
+            self.output.setPlainText(error)
+            self.output_title.setText(f"Qiskit importer (rewriting: ERROR)")
+            return
+        
+        red_format = QTextCharFormat()
+        red_format.setForeground(QColor("#cc0000"))
+        
+        include_format = QTextCharFormat()
+        include_format.setForeground(QColor("#303030"))
+        include_format.setBackground(QColor("#e0e0e0"))
+        
+        default_format = QTextCharFormat()
+        
+        if issues:
+            cursor.insertText("Unsupported / rewritten constructs:\n", red_format)
+            for issue in issues:
+                text = f"- {issue.kind}: {issue.detail} at lines {issue.start}-{issue.end}\n"
+                cursor.insertText(text, red_format)
+            cursor.insertText("\n", default_format)
+        
+        # Get the set of standard gate lines for comparison
+        stdgates_lines = set(line.strip() for line in stdgates_compat_lines())
+        
+        # Insert each line, using dark-gray format for expanded includes
+        lines = rewritten.rstrip().split("\n")
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            is_include_line = stripped in stdgates_lines
+            fmt = include_format if is_include_line else default_format
+            cursor.insertText(line + ("\n" if i < len(lines) - 1 else ""), fmt)
+        
+        status = "OK" if success else "ERROR"
+        self.output_title.setText(f"Qiskit importer (rewriting: {status})")
+
+    def set_circuit_info(self, circuit: Any, run_counts: Any | None = None, run_error: str | None = None, run_timestamp: datetime | None = None, run_status: str | None = None) -> None:
+        lines = [
+            "Circuit summary:",
+            f"qubits={circuit.num_qubits} clbits={circuit.num_clbits} depth={circuit.depth()}",
+            str(circuit.count_ops()),
+        ]
+        if run_status:
+            lines.append("")
+            lines.append(run_status)
+        if run_counts is not None:
+            lines.append("")
+            timestamp_str = f" (timestamp {run_timestamp.strftime('%H:%M:%S.%f')[:-3]})" if run_timestamp else ""
+            lines.append(f"Simulation results:{timestamp_str}")
+            lines.append(str(run_counts))
+        if run_error:
+            lines.append("")
+            lines.append(f"Run failed: {run_error}")
+        self.circuit_info.setPlainText("\n".join(lines))
+
+    def draw_circuit(self, circuit: Any) -> None:
+        fig = cast(Any, circuit_drawer(circuit, output="mpl"))
+        buf = BytesIO()
+        fig.savefig(buf, format="png", bbox_inches="tight", dpi=140)
+        try:
+            fig.clf()
+        except Exception:
+            pass
+        self.circuit.set_image(buf.getvalue())
+
+    def run_circuit_through_aer(self, circuit: Any) -> Any:
+        """Run a circuit through Aer simulator and return the counts."""
+        return run_circuit_counts(circuit, shots=1024)
+
+    def prompt_parameter_values(self, circuit: Any) -> Any | None:
+        if not getattr(circuit, "num_parameters", 0):
+            return circuit
+
+        bindings: dict[Any, Any] = {}
+        for parameter in circuit.parameters:
+            while True:
+                value_text, ok = QInputDialog.getText(
+                    self,
+                    "Parameter value",
+                    f"Enter a value for parameter ({parameter.name}):",
+                    QLineEdit.EchoMode.Normal,
+                    "0",
+                )
+                if not ok:
+                    return None
+                value = eval_text(value_text.strip(), {})
+                if value is None:
+                    QMessageBox.warning(
+                        self,
+                        "Invalid parameter value",
+                        f"Could not parse a value for {parameter.name}. Use a number or expression like pi/2.",
+                    )
+                    continue
+                bindings[parameter] = value
+                break
+
+        return circuit.assign_parameters(bindings)
+
+    def start_aer_run(self, circuit: Any) -> None:
+        self._aer_run_token += 1
+        token = self._aer_run_token
+        worker = AerRunWorker(token, circuit)
+        worker.signals.finished.connect(self.on_aer_run_finished)
+        self._thread_pool.start(worker)
+        self.statusBar().showMessage("Running simulation...", 3000)
+
+    def on_aer_run_finished(self, token: int, circuit: Any, counts: Any, error: Any, run_timestamp: Any) -> None:
+        if token != self._aer_run_token:
+            return
+        if error:
+            self.set_circuit_info(circuit, run_error=str(error), run_timestamp=run_timestamp)
+        else:
+            self.set_circuit_info(circuit, run_counts=counts, run_timestamp=run_timestamp)
+
+    def rewrite_current(self) -> None:
+        source = self.editor.toPlainText()
+        try:
+            rewritten, _, _ = transpile_qasm(source)
+        except Exception as exc:
+            QMessageBox.critical(self, "Rewrite failed", str(exc))
+            return
+
+        if rewritten == source:
+            self.statusBar().showMessage("No rewrite changes to apply", 3000)
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "Apply rewrite to source",
+            "This will replace the left 'QASM original' editor content with the rewritten importer-compatible text. Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        self._syncing = True
+        try:
+            self.editor.setPlainText(rewritten)
+        finally:
+            self._syncing = False
+        self.refresh_views()
+        self.statusBar().showMessage("Applied rewrite to source editor", 3000)
+
+    def run_current(self) -> None:
+        source = self.editor.toPlainText()
+        circuit = None
+        try:
+            rewritten, _, _ = transpile_qasm(source)
+            circuit = qiskit_parse(rewritten)
+            circuit = self.prompt_parameter_values(circuit)
+            if circuit is None:
+                self.statusBar().showMessage("Run cancelled", 3000)
+                return
+            self.draw_circuit(circuit)
+            self.set_circuit_info(circuit, run_status="Running simulation...")
+            self.start_aer_run(circuit)
+        except Exception as exc:
+            if circuit is not None:
+                self.set_circuit_info(circuit, run_error=str(exc))
+            else:
+                self.circuit_info.setPlainText(f"Run failed: {exc}")
+    def show_diagnostics(self) -> None:
+        lines = [
+            f"Python: {sys.version.split()[0]}",
+            f"Python executable: {sys.executable}",
+            f"PySide6: {PySide6.__version__}",
+            f"openqasm3: {getattr(sys.modules.get('openqasm3'), '__version__', 'unknown')}",
+            "",
+            "Qiskit runtime:",
+            f"  qiskit: {getattr(sys.modules.get('qiskit'), '__version__', 'unknown')}",
+            f"  qiskit-aer: {getattr(sys.modules.get('qiskit_aer'), '__version__', 'unknown')}",
+            f"  qiskit-qasm3-import: {getattr(qiskit_qasm3_import, '__version__', 'unknown')}",
+        ]
+
+        qiskit_smoke = "OPENQASM 3.0;\nqubit[1] q;\nbit[1] c;\nh q[0];\nc[0] = measure q[0];\n"
+        try:
+            t0 = time.perf_counter()
+            circuit = qiskit_parse(qiskit_smoke)
+            t_parse = (time.perf_counter() - t0) * 1000.0
+
+            backend = AerSimulator()
+            t1 = time.perf_counter()
+            compiled = transpile(circuit, backend)
+            t_transpile = (time.perf_counter() - t1) * 1000.0
+
+            t2 = time.perf_counter()
+            result = backend.run(compiled, shots=1024).result()
+            t_run = (time.perf_counter() - t2) * 1000.0
+
+            lines.append(f"  Aer backend: {backend.name}")
+            lines.append(f"  qasm3 parse smoke: ok ({t_parse:.1f} ms)")
+            lines.append(f"  transpile smoke: ok ({t_transpile:.1f} ms)")
+            lines.append(f"  run smoke (1024 shots): ok ({t_run:.1f} ms)")
+            lines.append(f"  counts sample: {result.get_counts()}")
+        except Exception as exc:
+            lines.append(f"  runtime smoke: failed ({exc})")
+
+        RulesDialog("\n".join(lines), self, title="Diagnostics").exec()
+
+    def show_rules(self) -> None:
+        RulesDialog(self.load_rewrite_rules_text(), self).exec()
+
+    def load_rewrite_rules_text(self) -> str:
+        if not REWRITE_RULES_FILE.exists():
+            return (
+                "Rewrite rules file not found.\n\n"
+                f"Expected file: {REWRITE_RULES_FILE}\n"
+                "Create this file to keep help text aligned with transpiler behavior."
+            )
+
+        text = REWRITE_RULES_FILE.read_text()
+        lower_text = text.lower()
+        missing = [marker for marker in REWRITE_RULES_SYNC_MARKERS if marker.lower() not in lower_text]
+        if not missing:
+            return text
+
+        warning = [
+            "",
+            "SYNC WARNING:",
+            "The rewrite_rules.txt file appears out of sync with transpiler behavior.",
+            "Missing required rule markers:",
+        ]
+        warning.extend(f"- {marker}" for marker in missing)
+        return text + "\n" + "\n".join(warning) + "\n"
+
+    def tree_node_at_cursor(self) -> Any | None:
+        if not self.current_program:
+            return None
+        pos = self.editor.textCursor().position()
+        block = self.editor.document().findBlock(pos)
+        line = block.blockNumber()
+        col = pos - block.position()
+        best = None
+        best_size = None
+
+        def walk(node: Any) -> None:
+            nonlocal best, best_size
+            s = span(node)
+            # Spans use 1-indexed line numbers, convert to 0-indexed for comparison
+            if s and (s.start_line - 1 < line or (s.start_line - 1 == line and s.start_column <= col)) and (s.end_line - 1 > line or (s.end_line - 1 == line and s.end_column > col)):
+                size = (s.end_line - s.start_line) * 1000 + (s.end_column - s.start_column)
+                if best is None or size < best_size:
+                    best = node
+                    best_size = size
+            for child in node_iter(node):
+                walk(child)
+
+        walk(self.current_program)
+        return best
+
+    def sync_tree_from_cursor(self) -> None:
+        if self._syncing or not self.current_program:
+            return
+        node = self.tree_node_at_cursor()
+        if node is None:
+            return
+        self._syncing = True
+        try:
+            self.select_tree_node(node)
+        finally:
+            self._syncing = False
+
+    def select_tree_node(self, target: Any) -> None:
+        def walk(item: QTreeWidgetItem) -> QTreeWidgetItem | None:
+            if item.data(0, Qt.ItemDataRole.UserRole) is target:
+                return item
+            for i in range(item.childCount()):
+                found = walk(item.child(i))
+                if found is not None:
+                    return found
+            return None
+
+        root = self.tree.topLevelItem(0)
+        if root is None:
+            return
+        found = walk(root)
+        if found is not None:
+            self.tree.setCurrentItem(found)
+            self.tree.scrollToItem(found)
+
+    def sync_editor_from_tree(self) -> None:
+        if self._syncing:
+            return
+        items = self.tree.selectedItems()
+        if not items:
+            return
+        node = items[0].data(0, Qt.ItemDataRole.UserRole)
+        s = span(node)
+        if not s:
+            return
+        self._syncing = True
+        try:
+            cursor = self.editor.textCursor()
+            # Spans use 1-indexed line numbers, convert to 0-indexed for to_pos
+            cursor.setPosition(clamp_cursor_pos(self.editor, to_pos(self.editor, s.start_line - 1, s.start_column)))
+            cursor.setPosition(clamp_cursor_pos(self.editor, to_pos(self.editor, s.end_line - 1, s.end_column + 1)), QTextCursor.MoveMode.KeepAnchor)
+            self.editor.setTextCursor(cursor)
+        finally:
+            self._syncing = False
+
+
+def main() -> int:
+    app = QApplication(sys.argv)
+    app.setApplicationName("QASM3 Aer Lab")
+    app.setOrganizationName("Copilot")
+    window = MainWindow()
+    screen = app.primaryScreen()
+    if screen is not None:
+        geo = screen.availableGeometry()
+        window.resize(int(geo.width() * 0.9), int(geo.height() * 0.9))
+    window.show()
+    return app.exec()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
