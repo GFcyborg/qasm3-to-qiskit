@@ -863,6 +863,8 @@ class MainWindow(QMainWindow):
         self._thread_pool = QThreadPool.globalInstance()
         self.current_program: Any | None = None
         self.font_size = 10
+        # Number of shots to use for Qiskit/Aer runs (user-configurable)
+        self.shots = 1024
 
         self.editor = CodeEditor()
         self.editor.textChanged.connect(self.debounced_refresh)
@@ -942,6 +944,10 @@ class MainWindow(QMainWindow):
         diag_action.setShortcut("Ctrl+D")
         diag_action.triggered.connect(self.show_diagnostics)
         run_menu.addAction(diag_action)
+        self.set_shots_action = QAction(f"Qiskit iterations ({self.shots})...", self)
+        self.set_shots_action.setStatusTip("Configure number of shots for Qiskit/Aer runs")
+        self.set_shots_action.triggered.connect(self.set_shots_dialog)
+        run_menu.addAction(self.set_shots_action)
 
         view_menu = self.menuBar().addMenu("View")
         zoom_in = QAction("Zoom in", self)
@@ -1133,7 +1139,7 @@ class MainWindow(QMainWindow):
 
     def run_circuit_through_aer(self, circuit: Any) -> Any:
         """Run a circuit through Aer simulator and return the counts."""
-        return run_circuit_counts(circuit, shots=1024)
+        return run_circuit_counts(circuit, shots=self.shots)
 
     def prompt_parameter_values(self, circuit: Any) -> Any | None:
         if not getattr(circuit, "num_parameters", 0):
@@ -1167,7 +1173,7 @@ class MainWindow(QMainWindow):
     def start_aer_run(self, circuit: Any) -> None:
         self._aer_run_token += 1
         token = self._aer_run_token
-        worker = AerRunWorker(token, circuit)
+        worker = AerRunWorker(token, circuit, shots=self.shots)
         worker.signals.finished.connect(self.on_aer_run_finished)
         self._thread_pool.start(worker)
         self.statusBar().showMessage("Running simulation...", 3000)
@@ -1228,6 +1234,26 @@ class MainWindow(QMainWindow):
                 self.set_circuit_info(circuit, run_error=str(exc))
             else:
                 self.circuit_info.setPlainText(f"Run failed: {exc}")
+    def set_shots_dialog(self) -> None:
+        """Prompt the user to configure the number of shots used for Qiskit/Aer runs."""
+        value, ok = QInputDialog.getInt(
+            self,
+            "Set shots",
+            "Number of shots:",
+            self.shots,
+            1,
+            10_000_000,
+            1,
+        )
+        if not ok:
+            return
+        self.shots = int(value)
+        # Update menu label to reflect new shots value
+        try:
+            self.set_shots_action.setText(f"Qiskit iterations ({self.shots})...")
+        except Exception:
+            pass
+        self.statusBar().showMessage(f"Shots set to {self.shots}", 3000)
     def show_diagnostics(self) -> None:
         lines = [
             f"Python: {sys.version.split()[0]}",
@@ -1253,13 +1279,13 @@ class MainWindow(QMainWindow):
             t_transpile = (time.perf_counter() - t1) * 1000.0
 
             t2 = time.perf_counter()
-            result = backend.run(compiled, shots=1024).result()
+            result = backend.run(compiled, shots=self.shots).result()
             t_run = (time.perf_counter() - t2) * 1000.0
 
             lines.append(f"  Aer backend: {backend.name}")
             lines.append(f"  qasm3 parse smoke: ok ({t_parse:.1f} ms)")
             lines.append(f"  transpile smoke: ok ({t_transpile:.1f} ms)")
-            lines.append(f"  run smoke (1024 shots): ok ({t_run:.1f} ms)")
+            lines.append(f"  run smoke ({self.shots} shots): ok ({t_run:.1f} ms)")
             lines.append(f"  counts sample: {result.get_counts()}")
         except Exception as exc:
             lines.append(f"  runtime smoke: failed ({exc})")
