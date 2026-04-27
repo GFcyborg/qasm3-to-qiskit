@@ -4,6 +4,10 @@ Desktop tool for testing OpenQASM 3 rewrite compatibility with `qiskit-qasm3-imp
 
 Official repository: https://github.com/GFcyborg/qasm3-to-qiskit
 
+## Screenshot
+
+![QASM3 Aer Lab - Example GUI](img/gui.png)
+
 ## What the app does
 
 - Left pane (`QASM original`): editable source text
