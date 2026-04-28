@@ -1084,7 +1084,7 @@ class MainWindow(QMainWindow):
         diag_action.setShortcut("Ctrl+D")
         diag_action.triggered.connect(self.show_diagnostics)
         run_menu.addAction(diag_action)
-        self.set_shots_action = QAction(f"Qiskit iterations ({self.shots})...", self)
+        self.set_shots_action = QAction(f"Qiskit shots ({self.shots})...", self)
         self.set_shots_action.setStatusTip("Configure number of shots for Qiskit/Aer runs")
         self.set_shots_action.triggered.connect(self.set_shots_dialog)
         run_menu.addAction(self.set_shots_action)
@@ -1394,7 +1394,7 @@ class MainWindow(QMainWindow):
         self.shots = int(value)
         # Update menu label to reflect new shots value
         try:
-            self.set_shots_action.setText(f"Qiskit iterations ({self.shots})...")
+            self.set_shots_action.setText(f"Qiskit shots ({self.shots})...")
         except Exception:
             pass
         self.statusBar().showMessage(f"Shots set to {self.shots}", 3000)
