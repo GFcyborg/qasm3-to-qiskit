@@ -476,7 +476,147 @@ def transpile_qasm(source: str) -> tuple[str, list[Issue], Any | None]:
         lines.append("OPENQASM 3.0;")
     for stmt in program.statements:
         lines.extend(emit_stmt(stmt, env, issues, 0))
-    rewritten = "\n".join(line for line in lines if line.strip()) + "\n"
+
+    def inferred_qubit_decl_lines() -> list[str]:
+        if any(kind(stmt) == "QubitDeclaration" for stmt in getattr(program, "statements", [])):
+            return []
+
+        usages: dict[str, int] = {}
+
+        def operand_name_and_max_index(operand: Any) -> tuple[str, int] | None:
+            k = kind(operand)
+            if k == "Identifier":
+                name = getattr(operand, "name", "")
+                return (name, 0) if name else None
+            if k == "IndexedIdentifier":
+                name_obj = getattr(operand, "name", None)
+                name = getattr(name_obj, "name", "")
+                if not name:
+                    return None
+                max_index = 0
+                for index_group in getattr(operand, "indices", []):
+                    for index_expr in index_group:
+                        value = eval_node(index_expr, {})
+                        if value is None:
+                            return None
+                        max_index = max(max_index, int(value))
+                return name, max_index
+            return None
+
+        for stmt in getattr(program, "statements", []):
+            if kind(stmt) == "QuantumGateDefinition":
+                continue
+            for operand in getattr(stmt, "qubits", []):
+                info = operand_name_and_max_index(operand)
+                if info is None:
+                    continue
+                name, max_index = info
+                usages[name] = max(usages.get(name, 0), max_index)
+
+        decl_lines: list[str] = []
+        for name in sorted(usages):
+            decl_lines.append(f"qubit[{usages[name] + 1}] {name};")
+        return decl_lines
+
+    qubit_decl_lines = inferred_qubit_decl_lines()
+    # If the source uses standard gates (CX, U, etc.) but does not include
+    # stdgates.inc, expand the compatibility gate definitions automatically
+    # so the rewritten output can be imported by Qiskit.  Do not insert defs
+    # that collide with user-defined gate names.
+    stdgates_defs = stdgates_compat_lines()
+    stdgates_names: list[str] = []
+    import re as _re
+    for defline in stdgates_defs:
+        m = _re.match(r"^gate\s+([A-Za-z_]\w*)", defline)
+        if m:
+            stdgates_names.append(m.group(1))
+
+    # Collect user-defined gate names from the AST to avoid re-defining them.
+    user_defined: set[str] = set()
+    try:
+        for stmt in getattr(program, "statements", []):
+            if kind(stmt) == "QuantumGateDefinition":
+                # Some AST nodes use `name` (Identifier) for gate defs
+                name_obj = getattr(stmt, "name", None) or getattr(stmt, "identifier", None)
+                name = getattr(name_obj, "name", None)
+                if name:
+                    user_defined.add(name)
+            for node in node_iter(stmt):
+                if kind(node) == "QuantumGateDefinition":
+                    name = getattr(getattr(node, "identifier", None), "name", None)
+                    if name:
+                        user_defined.add(name)
+    except Exception:
+        pass
+
+    joined = "\n".join(line for line in lines if line.strip())
+    # Only add defs if at least one std gate name is referenced and the defs
+    # are not already present in the emitted lines.
+    if stdgates_names:
+        pattern = _re.compile(r"\b(" + "|".join(_re.escape(n) for n in stdgates_names) + r")\b")
+        has_std_ref = bool(pattern.search(joined))
+        has_defs = any(defline.strip() in (ln.strip() for ln in lines) for defline in stdgates_defs)
+        if has_std_ref and not has_defs:
+            # Insert stdgates after an initial OPENQASM header if present,
+            # otherwise at the beginning.
+            # Filter out stdgates that would collide with user-defined gates
+            filtered_defs = []
+            filtered_names = []
+            for defline in stdgates_defs:
+                m = _re.match(r"^gate\s+([A-Za-z_]\w*)", defline)
+                if m:
+                    nm = m.group(1)
+                    if nm in user_defined:
+                        continue
+                    filtered_defs.append(defline)
+                    filtered_names.append(nm)
+
+            original_lines = [ln for ln in lines if ln.strip()]
+            if original_lines and original_lines[0].strip().upper().startswith("OPENQASM"):
+                out_lines = [original_lines[0]] + filtered_defs + original_lines[1:]
+                start_idx = 1 + len(filtered_defs)
+            else:
+                out_lines = filtered_defs + original_lines
+                start_idx = len(filtered_defs)
+
+            # Normalize usages of standard gate names in the original portion
+            # to the lowercase names we defined above (e.g. replace `CX` -> `cx`).
+            for i in range(start_idx, len(out_lines)):
+                line = out_lines[i]
+                for name in (filtered_names if 'filtered_names' in locals() else stdgates_names):
+                    up = name.upper()
+                    if up == name:
+                        continue
+                    line = _re.sub(rf"\b{_re.escape(up)}\b", name, line)
+                out_lines[i] = line
+
+            joined = "\n".join(out_lines)
+
+    if qubit_decl_lines:
+        out_lines = joined.splitlines()
+        insert_at = 0
+        in_gate_def = False
+        for idx, line in enumerate(out_lines):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.upper().startswith("OPENQASM"):
+                insert_at = idx + 1
+                continue
+            if in_gate_def:
+                if not line[: len(line) - len(line.lstrip())] and stripped == "}":
+                    insert_at = idx + 1
+                    in_gate_def = False
+                continue
+            if stripped.startswith("gate "):
+                in_gate_def = True
+                insert_at = idx + 1
+                continue
+            break
+        out_lines[insert_at:insert_at] = qubit_decl_lines
+        joined = "\n".join(out_lines)
+
+    rewritten = joined + "\n"
     rewritten = re.sub(r"\buint\b", "int", rewritten)
     rewritten = re.sub(r"\bstretch\s+\w+;\n?", "", rewritten)
     rewritten = re.sub(r"\bduration\s+\w+\s*=.*?;\n?", "", rewritten)
@@ -1018,6 +1158,10 @@ class MainWindow(QMainWindow):
         self._syncing = True
         try:
             self.editor.setPlainText(path.read_text())
+            # Clear any previously-marked spans immediately to avoid stale
+            # include/issue highlights showing before the view is refreshed.
+            self.editor.set_issue_spans([])
+            self.editor.set_include_spans([])
             self.setWindowTitle(f"{self.base_title} - {path.resolve()}")
             self.statusBar().showMessage(f"Loaded {path}")
         finally:
