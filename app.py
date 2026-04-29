@@ -1659,7 +1659,7 @@ class MainWindow(QMainWindow):
             f"  qiskit-qasm3-import: {getattr(qiskit_qasm3_import, '__version__', 'unknown')}",
         ]
 
-        qiskit_smoke = "OPENQASM 3.0;\nqubit[1] q;\nbit[1] c;\nh q[0];\nc[0] = measure q[0];\n"
+        qiskit_smoke = "OPENQASM 3.0;\ninclude \"stdgates.inc\";\nqubit[1] q;\nbit[1] c;\nh q[0];\nc[0] = measure q[0];\n"
         try:
             t0 = time.perf_counter()
             circuit = qiskit_parse(qiskit_smoke)
@@ -1677,8 +1677,8 @@ class MainWindow(QMainWindow):
             lines.append(f"  Aer backend: {backend.name}")
             lines.append(f"  qasm3 parse smoke: ok ({t_parse:.1f} ms)")
             lines.append(f"  transpile smoke: ok ({t_transpile:.1f} ms)")
-            lines.append(f"  run smoke ({self.shots} shots): ok ({t_run:.1f} ms)")
-            lines.append(f"  counts sample: {result.get_counts()}")
+            lines.append(f"  run smoke (Hadamard gate, {self.shots} shots): ok ({t_run:.1f} ms)")
+            lines.append(f"  counts sample (Hadamard gate): {result.get_counts()}")
         except Exception as exc:
             lines.append(f"  runtime smoke: failed ({exc})")
 
