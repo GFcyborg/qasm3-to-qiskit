@@ -21,38 +21,44 @@ Sync markers (do not remove; used by app.py consistency check):
 - Normalize uint tokens to int in rewritten output.
 - Strip residual stretch, duration, and delay forms in post-processing.
 
-Header and Includes
-- Adds OPENQASM 3.0; when the input source has no version header.
-- Replaces include "stdgates.inc" with inline compatibility gate definitions used by the qiskit importer.
-- Drops other include statements.
+INSERTIONS
+- Add OPENQASM 3.0; when the input source has no version header.
+  Examples: adder.qasm:1-4, gateteleport.qasm:1-6.
+- Replace include "stdgates.inc" with inline compatibility gate definitions used by the qiskit importer.
+  Examples: adder.qasm:4, teleport.qasm:3, qiskit-example.qasm:6.
 
-Classical Declarations and Constants
-- Folds constant declarations into a compile-time environment when initializer values are statically known.
-- Keeps only classical declarations of type bit or bool.
-- Drops unsupported classical declarations when they cannot be folded.
-- Rewrites uint tokens to int in output for importer compatibility.
+FOLDING / UNROLLING / UNBOXING
+- Fold const declarations into a compile-time environment when initializer values are statically known.
+  Examples: arrays.qasm:33-34, vqe.qasm:10-13, ipe.qasm:6-7.
+- Keep only classical declarations of type bit or bool; other classical declarations are dropped unless they can be folded.
+  Examples: qiskit-example.qasm:12-13, arrays.qasm:9,13, scqec.qasm:14.
+- Unroll for loops only when range bounds are statically known.
+  Examples: adder.qasm:33-41, ipe.qasm:22-28, scqec.qasm:36-44.
+- Fold if/else branches when conditions evaluate to compile-time booleans, or rewrite them when a qiskit-compatible condition can be emitted.
+  Examples: adder.qasm:34-35, qec.qasm:23-25, teleport.qasm:20-21.
+- Unbox box blocks by emitting only their body statements.
+  Example: dd.qasm:12-21.
 
-Control Flow
-- Unrolls for loops only when range bounds are statically known.
-- Drops for loops with non-static ranges and records an issue.
-- Folds if/else branches when conditions evaluate to compile-time booleans.
-- Rewrites bit/bool conditions into importer-compatible forms when needed.
+DATA-TYPE CASTINGS
+- Rewrite bit comparisons for qiskit-compatible conditions.
+  Examples: teleport.qasm:20-21, qec.qasm:23-25, inverseqft1.qasm:11-25.
+- Normalize uint tokens to int in rewritten output.
+  Examples: adder.qasm:22-23, arrays.qasm:33, t1.qasm:7-8.
+- Substitute compile-time environment values into emitted statements.
+  Examples: adder.qasm:22-35, arrays.qasm:34, ipe.qasm:6-8.
 
-Calibration and Timing
-- Removes unsupported calibration and timing constructs, including:
-  defcal grammar declarations, defcal blocks, extern declarations,
-  delay operations, stretch declarations, and duration declarations.
-- Unboxes box blocks by emitting only their body statements.
-
-Quantum Statements
-- Preserves quantum gate definitions.
-- Preserves quantum gate operations, reset statements, and measurement statements.
-- Applies compile-time substitution to emitted quantum statements.
-
-Environment Substitution
-- Replaces compile-time identifiers in expressions and statement text.
-- Simplifies bracketed index expressions when possible.
-
-Fallback Behavior
+OTHERS
+- Keep reset, measurement, gate definitions, and quantum gate operations.
+  Examples: teleport.qasm:11,18-23, adder.qasm:7-15,25-41, qec.qasm:18-26.
 - Uses OpenQASM serializer for remaining statement types when possible.
+  Examples: arrays.qasm:43-100, msd.qasm:85-154.
 - Records a rewrite issue when a statement cannot be emitted.
+  Examples: vqe.qasm:16-23, scqec.qasm:16-18.
+
+**DROPPING**
+- Drop includes other than stdgates.inc.
+  Current local examples only use stdgates.inc; the rule remains for user code that imports other include files.
+- Drop unsupported classical declarations that cannot be folded.
+  Examples: arrays.qasm:9,13, scqec.qasm:14.
+- Drop calibration grammar/definitions, extern declarations, delays, stretch, and duration statements.
+  Examples: defcal.qasm:1,3-29, vqe.qasm:17-23, dd.qasm:7-21, t1.qasm:13,18,21,34,36.
