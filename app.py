@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import dataclasses
+import concurrent.futures
+import multiprocessing
 import math
 import re
 import subprocess
@@ -149,6 +151,22 @@ def run_circuit_counts(circuit: Any, shots: int = 1024) -> Any:
     compiled = transpile(circuit, backend)
     result = backend.run(compiled, shots=shots).result()
     return result.get_counts()
+
+
+def run_aer_job(circuit: Any, shots: int) -> tuple[Any | None, str | None, datetime]:
+    run_timestamp = datetime.now()
+    try:
+        return run_circuit_counts(circuit, shots), None, run_timestamp
+    except Exception as exc:
+        return None, str(exc), run_timestamp
+
+
+def format_elapsed_time(seconds: float) -> str:
+    total_milliseconds = max(0, int(round(seconds * 1000.0)))
+    hours, remainder = divmod(total_milliseconds, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    secs, milliseconds = divmod(remainder, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}.{milliseconds:03d}"
 
 
 def subst_env(text: str, env: dict[str, Any]) -> str:
@@ -1000,7 +1018,15 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(self.base_title)
         self._syncing = False
         self._aer_run_token = 0
-        self._thread_pool = QThreadPool.globalInstance()
+        self._aer_stopwatch_timer = QTimer(self)
+        self._aer_stopwatch_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._aer_stopwatch_timer.setInterval(50)
+        self._aer_stopwatch_timer.timeout.connect(self._refresh_aer_run_state)
+        self._aer_run_start_monotonic: float | None = None
+        self._aer_executor: concurrent.futures.ProcessPoolExecutor | None = None
+        self._aer_future: concurrent.futures.Future[tuple[Any | None, str | None, datetime]] | None = None
+        self._aer_future_token: int | None = None
+        self._aer_future_circuit: Any | None = None
         self.current_program: Any | None = None
         self.font_size = 10
         # Number of shots to use for Qiskit/Aer runs (user-configurable)
@@ -1045,6 +1071,11 @@ class MainWindow(QMainWindow):
         bottom.setStretchFactor(0, 2)
         bottom.setStretchFactor(1, 3)
         self.setCentralWidget(root)
+
+        self._aer_stopwatch_label = QLabel("")
+        self._aer_stopwatch_label.setVisible(False)
+        self._aer_stopwatch_label.setStyleSheet("font-weight: 700; color: #1f6f2a; padding-left: 8px; padding-right: 8px;")
+        self.statusBar().addPermanentWidget(self._aer_stopwatch_label)
 
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
@@ -1199,7 +1230,7 @@ class MainWindow(QMainWindow):
         self.editor.set_issue_spans(mark_unsupported(program, self.editor) if program else [])
         self.editor.set_include_spans(mark_includes(program, self.editor) if program else [])
         if circuit is not None:
-            self.draw_circuit(circuit)
+            self.show_circuit(circuit)
             if getattr(circuit, "num_parameters", 0):
                 self.set_circuit_info(
                     circuit,
@@ -1252,7 +1283,7 @@ class MainWindow(QMainWindow):
         status = "OK" if success else "ERROR"
         self.output_title.setText(f"Qiskit importer (rewriting: {status})")
 
-    def set_circuit_info(self, circuit: Any, run_counts: Any | None = None, run_error: str | None = None, run_timestamp: datetime | None = None, run_status: str | None = None) -> None:
+    def _build_circuit_info_lines(self, circuit: Any, run_counts: Any | None = None, run_error: str | None = None, run_timestamp: datetime | None = None, run_status: str | None = None, run_duration: float | None = None) -> list[str]:
         lines = [
             "Circuit summary:",
             f"qubits={circuit.num_qubits} clbits={circuit.num_clbits} depth={circuit.depth()}",
@@ -1263,13 +1294,32 @@ class MainWindow(QMainWindow):
             lines.append(run_status)
         if run_counts is not None:
             lines.append("")
-            timestamp_str = f" (timestamp {run_timestamp.strftime('%H:%M:%S.%f')[:-3]})" if run_timestamp else ""
-            lines.append(f"Simulation results:{timestamp_str}")
+            meta_parts: list[str] = []
+            if run_timestamp is not None:
+                meta_parts.append(f"timestamp {run_timestamp.strftime('%H:%M:%S.%f')[:-3]}")
+            if run_duration is not None:
+                meta_parts.append(f"total computation time {format_elapsed_time(run_duration)}")
+            meta_text = f" ({', '.join(meta_parts)})" if meta_parts else ""
+            lines.append(f"Simulation results:{meta_text}")
             lines.append(str(run_counts))
         if run_error:
             lines.append("")
             lines.append(f"Run failed: {run_error}")
-        self.circuit_info.setPlainText("\n".join(lines))
+        return lines
+
+    def set_circuit_info(self, circuit: Any, run_counts: Any | None = None, run_error: str | None = None, run_timestamp: datetime | None = None, run_status: str | None = None, run_duration: float | None = None) -> None:
+        self.circuit_info.setPlainText(
+            "\n".join(
+                self._build_circuit_info_lines(
+                    circuit,
+                    run_counts=run_counts,
+                    run_error=run_error,
+                    run_timestamp=run_timestamp,
+                    run_status=run_status,
+                    run_duration=run_duration,
+                )
+            )
+        )
 
     def draw_circuit(self, circuit: Any) -> None:
         fig = cast(Any, circuit_drawer(circuit, output="mpl"))
@@ -1280,6 +1330,13 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self.circuit.set_image(buf.getvalue())
+
+    def show_circuit(self, circuit: Any) -> None:
+        try:
+            self.draw_circuit(circuit)
+        except Exception as exc:
+            self.circuit.show_placeholder()
+            self.circuit_info.setPlainText(f"Circuit draw failed: {exc}")
 
     def run_circuit_through_aer(self, circuit: Any) -> Any:
         """Run a circuit through Aer simulator and return the counts."""
@@ -1317,18 +1374,102 @@ class MainWindow(QMainWindow):
     def start_aer_run(self, circuit: Any) -> None:
         self._aer_run_token += 1
         token = self._aer_run_token
-        worker = AerRunWorker(token, circuit, shots=self.shots)
-        worker.signals.finished.connect(self.on_aer_run_finished)
-        self._thread_pool.start(worker)
-        self.statusBar().showMessage("Running simulation...", 3000)
+        self._aer_run_start_monotonic = time.perf_counter()
+        self.start_aer_stopwatch()
+        self._aer_stopwatch_timer.start()
+        self._update_aer_stopwatch()
+        if self._aer_executor is None:
+            self._aer_executor = concurrent.futures.ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn"))
+        self._aer_future_token = token
+        self._aer_future_circuit = circuit
+        self._aer_future = self._aer_executor.submit(run_aer_job, circuit, self.shots)
 
     def on_aer_run_finished(self, token: int, circuit: Any, counts: Any, error: Any, run_timestamp: Any) -> None:
         if token != self._aer_run_token:
             return
+        run_duration = None
+        if self._aer_run_start_monotonic is not None:
+            run_duration = time.perf_counter() - self._aer_run_start_monotonic
+        self._aer_stopwatch_timer.stop()
+        self._aer_run_start_monotonic = None
+        self.stop_aer_stopwatch()
         if error:
-            self.set_circuit_info(circuit, run_error=str(error), run_timestamp=run_timestamp)
+            self.set_circuit_info(circuit, run_error=str(error), run_timestamp=run_timestamp, run_duration=run_duration)
+            self.statusBar().showMessage("Simulation failed", 3000)
         else:
-            self.set_circuit_info(circuit, run_counts=counts, run_timestamp=run_timestamp)
+            self.set_circuit_info(circuit, run_counts=counts, run_timestamp=run_timestamp, run_duration=run_duration)
+            self.statusBar().showMessage("Simulation complete", 3000)
+
+    def start_aer_stopwatch(self) -> None:
+        self._aer_stopwatch_label.setVisible(True)
+        self._aer_stopwatch_label.setText("Running simulation... 00:00:00.000")
+
+    def stop_aer_stopwatch(self) -> None:
+        self._aer_stopwatch_label.clear()
+        self._aer_stopwatch_label.setVisible(False)
+
+    def _shutdown_aer_executor(self) -> None:
+        self._aer_stopwatch_timer.stop()
+        self._aer_run_start_monotonic = None
+        self._aer_future = None
+        self._aer_future_token = None
+        self._aer_future_circuit = None
+        executor = self._aer_executor
+        self._aer_executor = None
+        if executor is None:
+            return
+        try:
+            processes = list(getattr(executor, "_processes", {}).values())
+        except Exception:
+            processes = []
+        for process in processes:
+            try:
+                if process.is_alive():
+                    process.terminate()
+            except Exception:
+                pass
+        for process in processes:
+            try:
+                process.join(timeout=1)
+            except Exception:
+                pass
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+
+    def _refresh_aer_run_state(self) -> None:
+        if self._aer_run_start_monotonic is None:
+            return
+        self._update_aer_stopwatch()
+        future = self._aer_future
+        if future is None or not future.done():
+            return
+        token = self._aer_future_token
+        if token is None:
+            return
+        try:
+            counts, error, run_timestamp = future.result()
+        except Exception as exc:
+            counts = None
+            error = str(exc)
+            run_timestamp = datetime.now()
+        circuit = self._aer_future_circuit
+        self._aer_future = None
+        self._aer_future_token = None
+        self._aer_future_circuit = None
+        if circuit is not None:
+            self.on_aer_run_finished(token, circuit, counts, error, run_timestamp)
+
+    def _update_aer_stopwatch(self) -> None:
+        if self._aer_run_start_monotonic is None:
+            return
+        elapsed = time.perf_counter() - self._aer_run_start_monotonic
+        self._aer_stopwatch_label.setText(f"Running simulation... {format_elapsed_time(elapsed)}")
+
+    def closeEvent(self, event: Any) -> None:
+        self._shutdown_aer_executor()
+        super().closeEvent(event)
 
     def rewrite_current(self) -> None:
         source = self.editor.toPlainText()
@@ -1370,7 +1511,7 @@ class MainWindow(QMainWindow):
             if circuit is None:
                 self.statusBar().showMessage("Run cancelled", 3000)
                 return
-            self.draw_circuit(circuit)
+            self.show_circuit(circuit)
             self.set_circuit_info(circuit, run_status="Running simulation...")
             self.start_aer_run(circuit)
         except Exception as exc:
@@ -1378,6 +1519,7 @@ class MainWindow(QMainWindow):
                 self.set_circuit_info(circuit, run_error=str(exc))
             else:
                 self.circuit_info.setPlainText(f"Run failed: {exc}")
+
     def set_shots_dialog(self) -> None:
         """Prompt the user to configure the number of shots used for Qiskit/Aer runs."""
         value, ok = QInputDialog.getInt(
