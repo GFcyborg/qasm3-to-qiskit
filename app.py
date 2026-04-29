@@ -200,7 +200,6 @@ def format_counts_readable(run_counts: Any) -> list[str]:
     total_shots = sum(count for _, count in rows)
 
     lines = [
-        f"Total shots: {total_shots}",
         "Measurement outcomes:",
         "  reading -> occurrences (share of shots)",
     ]
@@ -531,8 +530,7 @@ def transpile_qasm(source: str) -> tuple[str, list[Issue], Any | None]:
     env: dict[str, Any] = {}
     issues: list[Issue] = []
     lines: list[str] = []
-    if not source.lstrip().startswith("OPENQASM"):
-        lines.append("OPENQASM 3.0;")
+    lines.append("OPENQASM 3.0;")
     for stmt in program.statements:
         lines.extend(emit_stmt(stmt, env, issues, 0))
 
@@ -1143,7 +1141,9 @@ class MainWindow(QMainWindow):
         top.addWidget(editor_panel)
         top.addWidget(output_panel)
         bottom = QSplitter(Qt.Orientation.Horizontal)
-        tree_panel, _ = self.make_titled_panel("AST parse-tree (original -> openqasm3)", "#d9f3d6", self.tree)
+        tree_title = "AST parse-tree (original -> openqasm3/antlr4)"
+        tree_panel, tree_label = self.make_titled_panel(tree_title, "#d9f3d6", self.tree)
+        tree_panel.setMinimumWidth(tree_label.fontMetrics().horizontalAdvance(tree_title) + 24)
         circuit_panel_titled, _ = self.make_titled_panel("Qiskit AER runtime (rewritten -> qiskit_qasm3_import)", "#ffd9d9", circuit_panel)
         bottom.addWidget(tree_panel)
         bottom.addWidget(circuit_panel_titled)
@@ -1203,6 +1203,11 @@ class MainWindow(QMainWindow):
         find_action.setShortcut(QKeySequence.StandardKey.Find)
         find_action.triggered.connect(self.show_search_dialog)
         view_menu.addAction(find_action)
+        rewrite_action = QAction("Analyze rewritten as if original", self)
+        rewrite_action.setShortcut("Ctrl+E")
+        rewrite_action.setStatusTip("Replace QASM original with the rewritten importer-compatible text")
+        rewrite_action.triggered.connect(self.rewrite_current)
+        view_menu.addAction(rewrite_action)
 
         run_menu = self.menuBar().addMenu("Run")
         run_action = QAction("Run manually (w/ params)", self)
@@ -1213,11 +1218,6 @@ class MainWindow(QMainWindow):
         self.set_shots_action.setStatusTip("Configure number of shots for Qiskit/Aer runs")
         self.set_shots_action.triggered.connect(self.set_shots_dialog)
         run_menu.addAction(self.set_shots_action)
-        rewrite_action = QAction("Apply rewrite to source", self)
-        rewrite_action.setShortcut("Ctrl+E")
-        rewrite_action.setStatusTip("Replace QASM original with the rewritten importer-compatible text")
-        rewrite_action.triggered.connect(self.rewrite_current)
-        run_menu.addAction(rewrite_action)
         diag_action = QAction("Diagnostics", self)
         diag_action.setShortcut("Ctrl+D")
         diag_action.triggered.connect(self.show_diagnostics)
@@ -1430,6 +1430,16 @@ class MainWindow(QMainWindow):
                 meta_parts.append(f"start timestamp {format_utc_timestamp(run_timestamp)}")
             if run_duration is not None:
                 meta_parts.append(f"total computation time {format_elapsed_time(run_duration)}")
+            # Append total shots into the Simulation results parentheses
+            total_shots_text = ""
+            if isinstance(run_counts, dict):
+                try:
+                    total_shots = sum(int(v) for v in run_counts.values())
+                    total_shots_text = f"Total shots: {total_shots}"
+                except Exception:
+                    total_shots_text = ""
+            if total_shots_text:
+                meta_parts.append(total_shots_text)
             meta_text = f" ({', '.join(meta_parts)})" if meta_parts else ""
             lines.append(f"Simulation results:{meta_text}")
             lines.extend(format_counts_readable(run_counts))
@@ -1623,7 +1633,7 @@ class MainWindow(QMainWindow):
 
         answer = QMessageBox.question(
             self,
-            "Apply rewrite to source",
+            "Analyze rewritten as if original",
             "This will replace the left 'QASM original' editor content with the rewritten importer-compatible text. Continue?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
