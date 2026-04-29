@@ -182,6 +182,34 @@ def format_utc_timestamp(value: datetime) -> str:
     return utc_value.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] + " UTC"
 
 
+def format_counts_readable(run_counts: Any) -> list[str]:
+    if not isinstance(run_counts, dict):
+        return [f"Raw counts: {run_counts}"]
+
+    rows: list[tuple[str, int]] = []
+    for reading, count in run_counts.items():
+        try:
+            rows.append((str(reading), int(count)))
+        except Exception:
+            rows.append((str(reading), 0))
+
+    if not rows:
+        return ["No measurement counts returned."]
+
+    rows.sort(key=lambda item: (-item[1], item[0]))
+    total_shots = sum(count for _, count in rows)
+
+    lines = [
+        f"Total shots: {total_shots}",
+        "Measurement outcomes:",
+        "  reading -> occurrences (share of shots)",
+    ]
+    for reading, count in rows:
+        pct = (100.0 * count / total_shots) if total_shots else 0.0
+        lines.append(f"  {reading} -> {count} ({pct:.2f}%)")
+    return lines
+
+
 def subst_env(text: str, env: dict[str, Any]) -> str:
     for name, value in sorted(env.items(), key=lambda item: -len(item[0])):
         text = re.sub(rf"\b{name}\b", str(value), text)
@@ -1404,7 +1432,7 @@ class MainWindow(QMainWindow):
                 meta_parts.append(f"total computation time {format_elapsed_time(run_duration)}")
             meta_text = f" ({', '.join(meta_parts)})" if meta_parts else ""
             lines.append(f"Simulation results:{meta_text}")
-            lines.append(str(run_counts))
+            lines.extend(format_counts_readable(run_counts))
         if run_error:
             lines.append("")
             lines.append(f"Run failed: {run_error}")
