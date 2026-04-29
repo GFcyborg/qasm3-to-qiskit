@@ -20,13 +20,17 @@ from urllib.parse import urlparse
 import PySide6
 import qiskit_qasm3_import
 from PySide6.QtCore import QObject, QRunnable, QRect, QSize, Qt, QThreadPool, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QFont, QKeySequence, QPainter, QPixmap, QTextCharFormat, QTextCursor, QTextFormat
+from PySide6.QtGui import QAction, QColor, QFont, QKeySequence, QPainter, QPixmap, QTextCharFormat, QTextCursor, QTextDocument, QTextFormat
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
     QFileDialog,
     QGraphicsScene,
     QGraphicsView,
+    QComboBox,
+    QCheckBox,
+    QHBoxLayout,
+    QFormLayout,
     QLabel,
     QMainWindow,
     QMenu,
@@ -998,6 +1002,50 @@ class RulesDialog(QDialog):
         layout.addWidget(close)
 
 
+class SearchDialog(QDialog):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Find QASM")
+        self.resize(420, 160)
+
+        layout = QFormLayout(self)
+        self.query = QLineEdit()
+        self.scope = QComboBox()
+        self.scope.addItems(["Original QASM", "Rewritten QASM", "Both"])
+        self.case_sensitive = QCheckBox("Case sensitive")
+
+        layout.addRow("Find:", self.query)
+        layout.addRow("Search in:", self.scope)
+        layout.addRow("", self.case_sensitive)
+
+        buttons = QHBoxLayout()
+        find_button = QPushButton("Find next")
+        close_button = QPushButton("Close")
+        find_button.clicked.connect(self._find_next)
+        self.query.returnPressed.connect(self._find_next)
+        close_button.clicked.connect(self.reject)
+        buttons.addWidget(find_button)
+        buttons.addWidget(close_button)
+        layout.addRow(buttons)
+
+    def text(self) -> str:
+        return self.query.text().strip()
+
+    def search_scope(self) -> str:
+        return self.scope.currentText()
+
+    def is_case_sensitive(self) -> bool:
+        return self.case_sensitive.isChecked()
+
+    def _find_next(self) -> None:
+        parent = self.parent()
+        if parent is None:
+            return
+        find_text = getattr(parent, "find_text", None)
+        if callable(find_text):
+            find_text(self.text(), self.search_scope(), self.is_case_sensitive())
+
+
 class MainWindow(QMainWindow):
     def make_titled_panel(self, title: str, color: str, content: QWidget) -> tuple[QWidget, QLabel]:
         panel = QWidget()
@@ -1032,6 +1080,7 @@ class MainWindow(QMainWindow):
         self._aer_future: concurrent.futures.Future[tuple[Any | None, str | None, datetime]] | None = None
         self._aer_future_token: int | None = None
         self._aer_future_circuit: Any | None = None
+        self._search_dialog: SearchDialog | None = None
         self.current_program: Any | None = None
         self.font_size = 10
         # Number of shots to use for Qiskit/Aer runs (user-configurable)
@@ -1106,25 +1155,6 @@ class MainWindow(QMainWindow):
         quit_action.triggered.connect(self.close)
         file_menu.addAction(quit_action)
 
-        run_menu = self.menuBar().addMenu("Run")
-        run_action = QAction("Run manually (w/ params)", self)
-        run_action.setShortcut("Ctrl+R")
-        run_action.triggered.connect(self.run_current)
-        run_menu.addAction(run_action)
-        rewrite_action = QAction("Apply rewrite to source", self)
-        rewrite_action.setShortcut("Ctrl+E")
-        rewrite_action.setStatusTip("Replace QASM original with the rewritten importer-compatible text")
-        rewrite_action.triggered.connect(self.rewrite_current)
-        run_menu.addAction(rewrite_action)
-        diag_action = QAction("Diagnostics", self)
-        diag_action.setShortcut("Ctrl+D")
-        diag_action.triggered.connect(self.show_diagnostics)
-        run_menu.addAction(diag_action)
-        self.set_shots_action = QAction(f"Qiskit shots ({self.shots})...", self)
-        self.set_shots_action.setStatusTip("Configure number of shots for Qiskit/Aer runs")
-        self.set_shots_action.triggered.connect(self.set_shots_dialog)
-        run_menu.addAction(self.set_shots_action)
-
         view_menu = self.menuBar().addMenu("View")
         zoom_in = QAction("Zoom in", self)
         zoom_in.setShortcut(QKeySequence.StandardKey.ZoomIn)
@@ -1137,6 +1167,29 @@ class MainWindow(QMainWindow):
         reset_font = QAction("Reset font", self)
         reset_font.triggered.connect(lambda: self.set_font_size(10))
         view_menu.addAction(reset_font)
+        find_action = QAction("Find...", self)
+        find_action.setShortcut(QKeySequence.StandardKey.Find)
+        find_action.triggered.connect(self.show_search_dialog)
+        view_menu.addAction(find_action)
+
+        run_menu = self.menuBar().addMenu("Run")
+        run_action = QAction("Run manually (w/ params)", self)
+        run_action.setShortcut("Ctrl+R")
+        run_action.triggered.connect(self.run_current)
+        run_menu.addAction(run_action)
+        self.set_shots_action = QAction(f"Qiskit shots ({self.shots})...", self)
+        self.set_shots_action.setStatusTip("Configure number of shots for Qiskit/Aer runs")
+        self.set_shots_action.triggered.connect(self.set_shots_dialog)
+        run_menu.addAction(self.set_shots_action)
+        rewrite_action = QAction("Apply rewrite to source", self)
+        rewrite_action.setShortcut("Ctrl+E")
+        rewrite_action.setStatusTip("Replace QASM original with the rewritten importer-compatible text")
+        rewrite_action.triggered.connect(self.rewrite_current)
+        run_menu.addAction(rewrite_action)
+        diag_action = QAction("Diagnostics", self)
+        diag_action.setShortcut("Ctrl+D")
+        diag_action.triggered.connect(self.show_diagnostics)
+        run_menu.addAction(diag_action)
 
         help_menu = self.menuBar().addMenu("Help")
         rules_action = QAction("Rewrite rules", self)
@@ -1184,6 +1237,49 @@ class MainWindow(QMainWindow):
         default = EXAMPLES / "adder.qasm"
         if default.exists():
             self.load_path(default)
+
+    def show_search_dialog(self) -> None:
+        if self._search_dialog is None:
+            self._search_dialog = SearchDialog(self)
+        if self._search_dialog.exec() == QDialog.DialogCode.Accepted:
+            self.find_text(self._search_dialog.text(), self._search_dialog.search_scope(), self._search_dialog.is_case_sensitive())
+
+    def _find_in_widget(self, widget: QPlainTextEdit, query: str, case_sensitive: bool) -> bool:
+        if not query:
+            return False
+        flags = QTextDocument.FindFlag(0)
+        if case_sensitive:
+            flags |= QTextDocument.FindFlag.FindCaseSensitively
+        cursor = widget.textCursor()
+        if cursor.hasSelection():
+            cursor.setPosition(cursor.selectionEnd())
+        found = widget.document().find(query, cursor, flags)
+        if found.isNull():
+            found = widget.document().find(query, QTextCursor(widget.document()), flags)
+        if found.isNull():
+            return False
+        widget.setTextCursor(found)
+        widget.ensureCursorVisible()
+        return True
+
+    def find_text(self, query: str, scope: str, case_sensitive: bool) -> None:
+        if not query:
+            return
+        widgets: list[QPlainTextEdit]
+        if scope == "Original QASM":
+            widgets = [self.editor]
+        elif scope == "Rewritten QASM":
+            widgets = [self.output]
+        else:
+            widgets = [self.editor, self.output]
+
+        for widget in widgets:
+            if self._find_in_widget(widget, query, case_sensitive):
+                widget.setFocus()
+                self.statusBar().showMessage(f"Found '{query}' in {scope.lower()}", 3000)
+                return
+
+        self.statusBar().showMessage(f"'{query}' not found", 3000)
 
     def open_file(self) -> None:
         name, _ = QFileDialog.getOpenFileName(self, "Open QASM", str(EXAMPLES), "QASM files (*.qasm *.inc);;All files (*)")
