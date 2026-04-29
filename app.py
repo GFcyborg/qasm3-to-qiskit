@@ -148,10 +148,14 @@ def eval_text(expr: str, env: dict[str, Any]) -> Any | None:
         return None
 
 
+AUTO_PARAM_DEFAULT_EXPR = "pi/2 - 1"
+AUTO_PARAM_DEFAULT_VALUE = (math.pi / 2.0) - 1.0
+
+
 def run_circuit_counts(circuit: Any, shots: int = 1024) -> Any:
     backend = AerSimulator()
     if getattr(circuit, "num_parameters", 0):
-        circuit = circuit.assign_parameters({parameter: 0.0 for parameter in circuit.parameters})
+        circuit = circuit.assign_parameters({parameter: AUTO_PARAM_DEFAULT_VALUE for parameter in circuit.parameters})
     compiled = transpile(circuit, backend)
     result = backend.run(compiled, shots=shots).result()
     return result.get_counts()
@@ -1335,7 +1339,7 @@ class MainWindow(QMainWindow):
             if getattr(circuit, "num_parameters", 0):
                 self.set_circuit_info(
                     circuit,
-                    run_status='Automatic runs use default parameter values (0.0). Use menu-item "Run manually (w/ params)" to enter values.',
+                    run_status=f'Auto-run uses default parameter=({AUTO_PARAM_DEFAULT_EXPR}); please use "Run manually (w/ params)" to enter custom values.',
                 )
             else:
                 self.set_circuit_info(circuit, run_status="Running simulation...")
@@ -1453,7 +1457,7 @@ class MainWindow(QMainWindow):
                     "Parameter value",
                     f"Enter a value for parameter ({parameter.name}):",
                     QLineEdit.EchoMode.Normal,
-                    "0",
+                    AUTO_PARAM_DEFAULT_EXPR,
                 )
                 if not ok:
                     return None
