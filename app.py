@@ -266,6 +266,8 @@ def eval_node(node: Any, env: dict[str, Any]) -> Any | None:
         return str(getattr(node, "value", "false")).lower() == "true"
     if k == "Identifier":
         return env.get(getattr(node, "name", ""))
+    if k == "ArrayLiteral":
+        return [eval_node(value, env) for value in getattr(node, "values", [])]
     if k == "IndexExpression":
         base = eval_node(getattr(node, "collection", None), env)
         if base is None:
