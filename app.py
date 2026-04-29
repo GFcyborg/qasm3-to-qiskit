@@ -11,7 +11,7 @@ import tempfile
 import time
 import webbrowser
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
 from typing import Any, cast
@@ -154,7 +154,7 @@ def run_circuit_counts(circuit: Any, shots: int = 1024) -> Any:
 
 
 def run_aer_job(circuit: Any, shots: int) -> tuple[Any | None, str | None, datetime]:
-    run_timestamp = datetime.now()
+    run_timestamp = datetime.now(timezone.utc)
     try:
         return run_circuit_counts(circuit, shots), None, run_timestamp
     except Exception as exc:
@@ -167,6 +167,11 @@ def format_elapsed_time(seconds: float) -> str:
     minutes, remainder = divmod(remainder, 60_000)
     secs, milliseconds = divmod(remainder, 1000)
     return f"{hours:02d}:{minutes:02d}:{secs:02d}.{milliseconds:03d}"
+
+
+def format_utc_timestamp(value: datetime) -> str:
+    utc_value = value.astimezone(timezone.utc)
+    return utc_value.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] + " UTC"
 
 
 def subst_env(text: str, env: dict[str, Any]) -> str:
@@ -1285,9 +1290,7 @@ class MainWindow(QMainWindow):
 
     def _build_circuit_info_lines(self, circuit: Any, run_counts: Any | None = None, run_error: str | None = None, run_timestamp: datetime | None = None, run_status: str | None = None, run_duration: float | None = None) -> list[str]:
         lines = [
-            "Circuit summary:",
-            f"qubits={circuit.num_qubits} clbits={circuit.num_clbits} depth={circuit.depth()}",
-            str(circuit.count_ops()),
+            f"Circuit summary: qubits={circuit.num_qubits} clbits={circuit.num_clbits} depth={circuit.depth()} {circuit.count_ops()}",
         ]
         if run_status:
             lines.append("")
@@ -1296,7 +1299,7 @@ class MainWindow(QMainWindow):
             lines.append("")
             meta_parts: list[str] = []
             if run_timestamp is not None:
-                meta_parts.append(f"timestamp {run_timestamp.strftime('%H:%M:%S.%f')[:-3]}")
+                meta_parts.append(f"start timestamp {format_utc_timestamp(run_timestamp)}")
             if run_duration is not None:
                 meta_parts.append(f"total computation time {format_elapsed_time(run_duration)}")
             meta_text = f" ({', '.join(meta_parts)})" if meta_parts else ""
