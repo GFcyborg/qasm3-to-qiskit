@@ -1506,6 +1506,8 @@ class MainWindow(QMainWindow):
     def stop_aer_stopwatch(self) -> None:
         self._aer_stopwatch_label.clear()
         self._aer_stopwatch_label.setVisible(False)
+        # Reset color to green
+        self._aer_stopwatch_label.setStyleSheet("font-weight: 700; color: #1f6f2a; padding-left: 8px; padding-right: 8px;")
 
     def _shutdown_aer_executor(self) -> None:
         self._aer_stopwatch_timer.stop()
@@ -1565,6 +1567,11 @@ class MainWindow(QMainWindow):
             return
         elapsed = time.perf_counter() - self._aer_run_start_monotonic
         self._aer_stopwatch_label.setText(f"Running simulation... {format_elapsed_time(elapsed)}")
+        # Turn red if execution exceeds 10 seconds
+        if elapsed >= 10.0:
+            self._aer_stopwatch_label.setStyleSheet("font-weight: 700; color: #c41e3a; padding-left: 8px; padding-right: 8px;")
+        else:
+            self._aer_stopwatch_label.setStyleSheet("font-weight: 700; color: #1f6f2a; padding-left: 8px; padding-right: 8px;")
 
     def closeEvent(self, event: Any) -> None:
         self._shutdown_aer_executor()
