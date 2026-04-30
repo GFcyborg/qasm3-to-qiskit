@@ -1772,11 +1772,21 @@ class MainWindow(QMainWindow):
             pass
         self.statusBar().showMessage(f"Shots set to {self.shots}", 3000)
     def show_diagnostics(self) -> None:
+        antlr4_version = "not installed"
+        try:
+            import importlib.metadata as importlib_metadata  # py3.8+
+
+            antlr4_version = importlib_metadata.version("antlr4-python3-runtime")
+        except Exception as exc:
+            if exc.__class__.__name__ != "PackageNotFoundError":
+                antlr4_version = "unknown"
+
         lines = [
             f"Python: {sys.version.split()[0]}",
             f"Python executable: {sys.executable}",
             f"PySide6: {PySide6.__version__}",
             f"openqasm3: {getattr(sys.modules.get('openqasm3'), '__version__', 'unknown')}",
+            f"antlr4-python3-runtime: {antlr4_version}",
             "",
             "Qiskit runtime:",
             f"  qiskit: {getattr(sys.modules.get('qiskit'), '__version__', 'unknown')}",
