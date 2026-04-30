@@ -527,7 +527,34 @@ def emit_stmt(stmt: Any, env: dict[str, Any], issues: list[Issue], indent: int =
         return []
 
 
+def extract_qasm_version(source: str) -> str:
+    """Extract OPENQASM version from source header. Returns '3.0', '3.1', or '3.0' (default)."""
+    for line in source.split('\n'):
+        stripped = line.strip()
+        if not stripped or stripped.startswith('#'):
+            continue
+        # Look for OPENQASM version header
+        if stripped.upper().startswith('OPENQASM'):
+            if '3.1' in stripped:
+                return '3.1'
+            elif '3.0' in stripped:
+                return '3.0'
+            # Fallback to 3.0 if version not recognized
+            return '3.0'
+    return '3.0'  # Default to 3.0 if no header found
+
+
 def transpile_qasm(source: str) -> tuple[str, list[Issue], Any | None]:
+    # Check if source explicitly specifies QASM 3.1; if so, pass through without rewriting
+    version = extract_qasm_version(source)
+    if version == '3.1':
+        try:
+            program = parse(source)
+            return source, [], program
+        except Exception:
+            # If parsing fails, fall through to normal rewriting attempt
+            pass
+    
     program = parse(source)
     env: dict[str, Any] = {}
     issues: list[Issue] = []
