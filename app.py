@@ -1117,6 +1117,7 @@ class MainWindow(QMainWindow):
         self.font_size = 10
         # Number of shots to use for Qiskit/Aer runs (user-configurable)
         self.shots = 1024
+        self._aer_timeout_seconds = 30
 
         self.editor = CodeEditor()
         self.editor.textChanged.connect(self.debounced_refresh)
@@ -1220,6 +1221,10 @@ class MainWindow(QMainWindow):
         self.set_shots_action.setStatusTip("Configure number of shots for Qiskit/Aer runs")
         self.set_shots_action.triggered.connect(self.set_shots_dialog)
         run_menu.addAction(self.set_shots_action)
+        self.set_aer_timeout_action = QAction(self._aer_timeout_action_text(), self)
+        self.set_aer_timeout_action.setStatusTip("Configure the maximum AER run time in seconds (0 = no timeout)")
+        self.set_aer_timeout_action.triggered.connect(self.set_aer_timeout_dialog)
+        run_menu.addAction(self.set_aer_timeout_action)
         diag_action = QAction("Diagnostics", self)
         diag_action.setShortcut("Ctrl+D")
         diag_action.triggered.connect(self.show_diagnostics)
@@ -1527,21 +1532,50 @@ class MainWindow(QMainWindow):
         self._aer_future_circuit = circuit
         self._aer_future = self._aer_executor.submit(run_aer_job, circuit, self.shots)
 
-    def on_aer_run_finished(self, token: int, circuit: Any, counts: Any, error: Any, run_timestamp: Any) -> None:
+    def on_aer_run_finished(self, token: int, circuit: Any, counts: Any, error: Any, run_timestamp: Any, run_duration: float | None = None) -> None:
         if token != self._aer_run_token:
             return
-        run_duration = None
-        if self._aer_run_start_monotonic is not None:
+        if run_duration is None and self._aer_run_start_monotonic is not None:
             run_duration = time.perf_counter() - self._aer_run_start_monotonic
         self._aer_stopwatch_timer.stop()
         self._aer_run_start_monotonic = None
         self.stop_aer_stopwatch()
+        self._aer_future = None
+        self._aer_future_token = None
+        self._aer_future_circuit = None
         if error:
             self.set_circuit_info(circuit, run_error=str(error), run_timestamp=run_timestamp, run_duration=run_duration)
             self.statusBar().showMessage("Simulation failed", 3000)
         else:
             self.set_circuit_info(circuit, run_counts=counts, run_timestamp=run_timestamp, run_duration=run_duration)
             self.statusBar().showMessage("Simulation complete", 3000)
+
+    def _aer_timeout_action_text(self) -> str:
+        if self._aer_timeout_seconds == 0:
+            return "AER timeout (no limit)..."
+        return f"AER timeout ({self._aer_timeout_seconds} sec)..."
+
+    def set_aer_timeout_dialog(self) -> None:
+        value, ok = QInputDialog.getInt(
+            self,
+            "Set AER timeout",
+            "Maximum AER runtime in seconds (0 = no timeout):",
+            self._aer_timeout_seconds,
+            0,
+            3_600,
+            1,
+        )
+        if not ok:
+            return
+        self._aer_timeout_seconds = int(value)
+        try:
+            self.set_aer_timeout_action.setText(self._aer_timeout_action_text())
+        except Exception:
+            pass
+        if self._aer_timeout_seconds == 0:
+            self.statusBar().showMessage("AER timeout disabled", 3000)
+        else:
+            self.statusBar().showMessage(f"AER timeout set to {self._aer_timeout_seconds} seconds", 3000)
 
     def start_aer_stopwatch(self) -> None:
         self._aer_stopwatch_label.setVisible(True)
@@ -1588,7 +1622,27 @@ class MainWindow(QMainWindow):
             return
         self._update_aer_stopwatch()
         future = self._aer_future
-        if future is None or not future.done():
+        if future is None:
+            return
+        timeout_seconds = self._aer_timeout_seconds
+        if timeout_seconds > 0 and self._aer_run_start_monotonic is not None:
+            elapsed = time.perf_counter() - self._aer_run_start_monotonic
+            if elapsed >= timeout_seconds and not future.done():
+                token = self._aer_future_token
+                circuit = self._aer_future_circuit
+                run_timestamp = datetime.now(timezone.utc)
+                self._shutdown_aer_executor()
+                if token is not None and circuit is not None:
+                    self.on_aer_run_finished(
+                        token,
+                        circuit,
+                        None,
+                        f"AER run timed out after {timeout_seconds} seconds",
+                        run_timestamp,
+                        run_duration=elapsed,
+                    )
+                return
+        if not future.done():
             return
         token = self._aer_future_token
         if token is None:

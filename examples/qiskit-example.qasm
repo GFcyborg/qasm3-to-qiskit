@@ -1,4 +1,5 @@
 // from: https://github.com/Qiskit/qiskit-qasm3-import
+// WARNING: setting param (a:=0) results in infinite always-true while-loop.
 
 OPENQASM 3.0;
 // The 'stdgates.inc' include is supported, and the gates are only available
