@@ -879,6 +879,28 @@ def transpile_qasm(source: str) -> tuple[str, list[Issue], Any | None]:
 
             joined = "\n".join(out_lines)
 
+    # Normalize hardware-qubit identifiers like $0 into a declared qubit
+    # register.  Detect `$<number>` usages in the emitted text, compute the
+    # required register size, choose a non-colliding name, insert a
+    # declaration and rewrite occurrences to `<hwname>[<index>]`.
+    hw_matches = _re.findall(r"\$([0-9]+)", joined)
+    if hw_matches:
+        hw_indices = [int(x) for x in hw_matches]
+        max_hw = max(hw_indices)
+        hw_name = "__hw"
+        # Ensure the chosen name does not collide with existing tokens in
+        # the emitted text.
+        while _re.search(rf"\b{_re.escape(hw_name)}\b", joined):
+            hw_name += "_"
+        hw_decl = f"qubit[{max_hw + 1}] {hw_name};"
+        # Rewrite `$N` occurrences to `hw_name[N]`.
+        joined = _re.sub(r"\$([0-9]+)", lambda m: f"{hw_name}[{int(m.group(1))}]", joined)
+        # Prepend hardware qubit declaration to any inferred qubit decls.
+        if 'qubit_decl_lines' in locals() and qubit_decl_lines:
+            qubit_decl_lines.insert(0, hw_decl)
+        else:
+            qubit_decl_lines = [hw_decl]
+
     if qubit_decl_lines:
         out_lines = joined.splitlines()
         insert_at = 0
