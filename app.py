@@ -19,7 +19,7 @@ from urllib.parse import urlparse
 
 import PySide6
 import qiskit_qasm3_import
-from PySide6.QtCore import QObject, QRunnable, QRect, QSize, Qt, QThreadPool, QTimer, Signal
+from PySide6.QtCore import QObject, QRunnable, QRect, QSize, Qt, QThreadPool, QTimer, Signal, QEvent
 from PySide6.QtGui import QAction, QColor, QFont, QKeySequence, QPainter, QPixmap, QTextCharFormat, QTextCursor, QTextDocument, QTextFormat
 from PySide6.QtWidgets import (
     QApplication,
@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QGraphicsScene,
     QGraphicsView,
+    QGraphicsPixmapItem,
     QComboBox,
     QCheckBox,
     QHBoxLayout,
@@ -1194,6 +1195,9 @@ class CircuitView(QGraphicsView):
         self._dragging = False
         self._drag_start_pos: tuple[int, int] | None = None
         self._scroll_bar_start: tuple[int, int] | None = None
+        # Whether the user has manually panned or zoomed the view.
+        # If True, automatic re-fitting on resize is suppressed until reset.
+        self._user_interacted = False
         self.show_placeholder()
 
     def create_placeholder_pixmap(self, width: int = 400, height: int = 300) -> QPixmap:
@@ -1219,7 +1223,9 @@ class CircuitView(QGraphicsView):
         self.scene().clear()
         placeholder = self.create_placeholder_pixmap(self.width() or 400, self.height() or 300)
         self.scene().addPixmap(placeholder)
-        self.fitInView(self.scene().itemsBoundingRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        # Auto-fit only when the user hasn't manually interacted.
+        if not self._user_interacted:
+            self._auto_fit_vertical_and_center()
 
     def set_image(self, image_bytes: bytes) -> None:
         self.scene().clear()
@@ -1228,11 +1234,15 @@ class CircuitView(QGraphicsView):
             self.show_placeholder()
             return
         self.scene().addPixmap(pixmap)
-        self.fitInView(self.scene().itemsBoundingRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        # Auto-fit only when the user hasn't manually interacted.
+        if not self._user_interacted:
+            self._auto_fit_vertical_and_center()
 
     def mousePressEvent(self, event: Any) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             self._dragging = True
+            # mark as user interaction when starting to drag
+            self._user_interacted = True
             pos = event.position().toPoint()
             self._drag_start_pos = (pos.x(), pos.y())
             self._scroll_bar_start = (
@@ -1247,6 +1257,8 @@ class CircuitView(QGraphicsView):
             pos = event.position().toPoint()
             dx = pos.x() - self._drag_start_pos[0]
             dy = pos.y() - self._drag_start_pos[1]
+            # any dragging counts as manual movement
+            self._user_interacted = True
             self.horizontalScrollBar().setValue(self._scroll_bar_start[0] - dx)
             self.verticalScrollBar().setValue(self._scroll_bar_start[1] - dy)
         super().mouseMoveEvent(event)
@@ -1261,12 +1273,73 @@ class CircuitView(QGraphicsView):
 
     def wheelEvent(self, event: Any) -> None:
         factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+        # user zoom — mark interaction so auto-fit won't override
+        self._user_interacted = True
         self.scale(factor, factor)
 
     def contextMenuEvent(self, event: Any) -> None:
         menu = QMenu(self)
-        menu.addAction("Reset zoom", lambda: self.fitInView(self.scene().itemsBoundingRect(), Qt.AspectRatioMode.KeepAspectRatio))
+        # Reset zoom restores automatic fitting behavior as if the user hadn't interacted.
+        def _reset_zoom():
+            self._user_interacted = False
+            self._auto_fit_vertical_and_center()
+        menu.addAction("Copy image (original size)", self._copy_image_to_clipboard)
+        menu.addAction("Reset zoom", _reset_zoom)
         menu.exec(event.globalPos())
+
+    def eventFilter(self, obj: QObject, event: Any) -> bool:
+        # Listen for resize events coming from the runtime-results text area
+        # (installed in MainWindow.__init__). When that area is resized, force
+        # the circuit view to V-fit and H-center the image.
+        if event.type() == QEvent.Type.Resize:
+            # Force auto-fit and reset manual-interaction flag so the view
+            # behaves as if not manually panned/zoomed.
+            self._user_interacted = False
+            self._auto_fit_vertical_and_center()
+        return super().eventFilter(obj, event)
+
+    def _copy_image_to_clipboard(self) -> None:
+        # Find the first QGraphicsPixmapItem in the scene and copy its
+        # underlying pixmap (original size) to the clipboard as an image.
+        for item in self.scene().items():
+            if isinstance(item, QGraphicsPixmapItem):
+                pix = item.pixmap()
+                if not pix.isNull():
+                    img = pix.toImage()
+                    QApplication.clipboard().setImage(img)
+                return
+
+    def resizeEvent(self, event: Any) -> None:
+        # When the view is resized (including indirect resizing via splitters),
+        # re-apply automatic vertical-fit and horizontal centering unless the
+        # user has manually panned/zoomed the view.
+        super().resizeEvent(event)
+        if not self._user_interacted:
+            self._auto_fit_vertical_and_center()
+
+    def _auto_fit_vertical_and_center(self) -> None:
+        """Scale the scene so its height fills the viewport and center it horizontally.
+
+        Keeps the original aspect ratio by using a uniform scale factor based
+        on the ratio of viewport height to scene height.
+        """
+        scene_rect = self.scene().itemsBoundingRect()
+        if scene_rect.isNull():
+            return
+
+        view_h = self.viewport().height()
+        scene_h = scene_rect.height()
+        if scene_h <= 0 or view_h <= 0:
+            return
+
+        # Reset any previous transform and scale uniformly to match viewport height.
+        self.resetTransform()
+        scale_factor = view_h / scene_h
+        self.scale(scale_factor, scale_factor)
+
+        # Center horizontally and vertically within the view (vertical centering
+        # is harmless when the image exactly fits the height).
+        self.centerOn(scene_rect.center())
 
 
 class RulesDialog(QDialog):
@@ -1382,6 +1455,9 @@ class MainWindow(QMainWindow):
         self.circuit_info = QPlainTextEdit()
         self.circuit_info.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self.circuit_info.setReadOnly(True)
+        # Ensure resizing the runtime text area triggers an auto-fit of the
+        # circuit view. CircuitView implements an eventFilter to handle this.
+        self.circuit_info.installEventFilter(self.circuit)
 
         circuit_panel = QSplitter(Qt.Orientation.Vertical)
         circuit_panel.addWidget(self.circuit)
