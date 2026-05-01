@@ -61,20 +61,24 @@ REPO_URLS = ROOT / "repositories.url"
 REWRITE_RULES_FILE = ROOT / "rewrite_rules.txt"
 REWRITE_RULES_SYNC_MARKERS = (
     "Insert OPENQASM 3.0 header when missing.",
+    "Normalize hardware qubit identifiers like $0 into a declared qubit register.",
     "Expand include \"stdgates.inc\" into inline compatibility gate definitions.",
     "Drop includes other than stdgates.inc.",
     "Fold const declarations with statically known values into an environment.",
     "Keep only classical declarations whose type is bit or bool.",
     "Drop unsupported classical declarations that cannot be folded.",
     "Unroll for loops only when range bounds are statically known.",
+    "Cap static loop unrolling to avoid output blow-ups.",
     "Fold branching statements when condition is statically known.",
     "Rewrite bit comparisons for qiskit-compatible conditions.",
-    "Drop calibration grammar/definitions, extern declarations, delays, stretch, and duration statements.",
+    "Drop calibration grammar/definitions, extern declarations, stretch, duration, and unsupported delay statements.",
     "Unbox box statements by emitting only their inner body statements.",
+    "Drop subroutines, aliasing, and classical assignments not supported by qiskit importer.",
+    "Rewrite gate definitions by rewriting/unrolling their bodies when needed.",
     "Keep reset, measurement, gate definitions, and quantum gate operations.",
     "Substitute compile-time environment values into emitted statements.",
     "Normalize uint tokens to int in rewritten output.",
-    "Strip residual stretch, duration, and delay forms in post-processing.",
+    "Strip residual stretch and duration forms in post-processing.",
 )
 
 
@@ -433,6 +437,14 @@ def is_supported_decl(stmt: Any) -> bool:
     return tname in {"BitType", "BoolType"}
 
 
+def contains_timing_constructs(node: Any) -> bool:
+    """Return True if the expression uses unsupported timing machinery."""
+    for child in node_iter(node):
+        if kind(child) in {"DurationOf", "StretchDeclaration", "DurationDeclaration", "DurationType", "StretchType"}:
+            return True
+    return kind(node) in {"DurationOf"}
+
+
 def emit_stmt(stmt: Any, env: dict[str, Any], issues: list[Issue], indent: int = 0) -> list[str]:
     pad = "  " * indent
     k = kind(stmt)
@@ -459,10 +471,90 @@ def emit_stmt(stmt: Any, env: dict[str, Any], issues: list[Issue], indent: int =
             return []
         issues.append(Issue(stmt.span.start_line, stmt.span.end_line, k.lower(), f"drop unsupported declaration {name}"))
         return []
+    if k == "ClassicalAssignment":
+        lvalue = getattr(stmt, "lvalue", None)
+        rvalue = getattr(stmt, "rvalue", None)
+        op = getattr(getattr(stmt, "op", None), "name", None) or str(getattr(stmt, "op", ""))
+        lvalue_kind = kind(lvalue)
+        rvalue_kind = kind(rvalue)
+
+        # Assignments into array elements/slices are not supported by the Qiskit
+        # importer, and attempting to substitute folded Python lists will
+        # produce invalid OpenQASM.  Drop these gracefully.
+        if lvalue_kind == "IndexExpression":
+            issues.append(Issue(stmt.span.start_line, stmt.span.end_line, k.lower(), "drop array/slice assignment (not supported by qiskit importer)"))
+            return []
+
+        # If this is a simple compile-time update, fold it into the environment
+        # so it can be substituted into later quantum operations and loop bounds.
+        if lvalue_kind == "Identifier":
+            name = getattr(lvalue, "name", "")
+            if name:
+                rhs = eval_node(rvalue, env)
+                if rhs is not None and name in env:
+                    try:
+                        if op == "=":
+                            env[name] = rhs
+                            return []
+                        if op == "+=":
+                            env[name] = env[name] + rhs
+                            return []
+                        if op == "-=":
+                            env[name] = env[name] - rhs
+                            return []
+                        if op == "*=":
+                            env[name] = env[name] * rhs
+                            return []
+                        if op == "/=":
+                            env[name] = env[name] / rhs
+                            return []
+                        if op == "%=":
+                            env[name] = env[name] % rhs
+                            return []
+                        if op == "<<=":
+                            env[name] = int(env[name]) << int(rhs)
+                            return []
+                        if op == ">>=":
+                            env[name] = int(env[name]) >> int(rhs)
+                            return []
+                        if op == "&=":
+                            env[name] = int(env[name]) & int(rhs)
+                            return []
+                        if op == "|=":
+                            env[name] = int(env[name]) | int(rhs)
+                            return []
+                        if op == "^=":
+                            env[name] = int(env[name]) ^ int(rhs)
+                            return []
+                    except Exception:
+                        pass
+
+        # Qiskit-qasm3-import does not support `def` subroutines; drop calls.
+        if rvalue_kind == "FunctionCall":
+            issues.append(Issue(stmt.span.start_line, stmt.span.end_line, k.lower(), "drop subroutine call assignment (not supported by qiskit importer)"))
+            return []
+
+        # Otherwise, keep the statement (this is needed for dynamic-circuit style
+        # code such as `mid[0] = measure q[0];`).
+        try:
+            # Avoid substituting folded array literals into the emitted OpenQASM;
+            # this can generate invalid syntax.  Classical assignments are kept
+            # verbatim unless they were folded above.
+            return [pad + dumps(stmt).strip()]
+        except Exception:
+            issues.append(Issue(stmt.span.start_line, stmt.span.end_line, k.lower(), "cannot emit classical assignment"))
+            return []
     if k == "ForInLoop":
         values = range_values(getattr(stmt, "set_declaration", None), env)
         if values is None:
             issues.append(Issue(stmt.span.start_line, stmt.span.end_line, k.lower(), "loop range is not statically known"))
+            return []
+        # Avoid output blow-ups when the source uses large shot loops.
+        # Qiskit importer can represent loops, but it cannot parse most of the
+        # classical machinery that tends to appear around these examples anyway.
+        MAX_UNROLL = 256
+        if len(values) > MAX_UNROLL:
+            issues.append(Issue(stmt.span.start_line, stmt.span.end_line, k.lower(), f"loop range too large to unroll ({len(values)} > {MAX_UNROLL})"))
             return []
         out: list[str] = []
         ident = getattr(getattr(stmt, "identifier", None), "name", "")
@@ -499,8 +591,30 @@ def emit_stmt(stmt: Any, env: dict[str, Any], issues: list[Issue], indent: int =
         for inner in getattr(stmt, "body", []):
             out.extend(emit_stmt(inner, env, issues, indent))
         return out
-    if k in {"CalibrationGrammarDeclaration", "CalibrationDefinition", "ExternDeclaration", "QuantumDelay", "StretchDeclaration", "DurationDeclaration"}:
+    if k in {
+        "CalibrationGrammarDeclaration",
+        "CalibrationDefinition",
+        "ExternDeclaration",
+        "StretchDeclaration",
+        "DurationDeclaration",
+        "ReturnStatement",
+        "ExpressionStatement",
+        "QuantumDelay",
+    }:
         issues.append(Issue(stmt.span.start_line, stmt.span.end_line, k.lower(), "not supported by qiskit importer"))
+        return []
+    if k == "DelayInstruction":
+        # Drop delays whose duration depends on timing constructs we do not keep
+        # (stretch, duration declarations, durationof).
+        duration_expr = getattr(stmt, "duration", None)
+        if duration_expr is not None:
+            if kind(duration_expr) == "Identifier" and getattr(duration_expr, "name", "") not in env:
+                issues.append(Issue(stmt.span.start_line, stmt.span.end_line, k.lower(), "drop delay (duration depends on dropped timing symbol)"))
+                return []
+            if contains_timing_constructs(duration_expr):
+                issues.append(Issue(stmt.span.start_line, stmt.span.end_line, k.lower(), "drop delay (unsupported timing construct)"))
+                return []
+        issues.append(Issue(stmt.span.start_line, stmt.span.end_line, k.lower(), "drop delay (not supported by qiskit importer)"))
         return []
     if k == "QuantumReset":
         return [pad + subst_env(dumps(stmt).strip(), env)]
@@ -512,7 +626,42 @@ def emit_stmt(stmt: Any, env: dict[str, Any], issues: list[Issue], indent: int =
             text = re.sub(r"^u\b", "U(0, 0, 0)", text)
         return [pad + text]
     if k == "QuantumGateDefinition":
-        return [pad + dumps(stmt).strip()]
+        # Re-emit gate definitions with rewritten bodies so we can unroll static
+        # loops inside the gate body (Qiskit does not reliably parse these).
+        name = getattr(getattr(stmt, "name", None), "name", "")
+        params: list[str] = []
+        for arg in getattr(stmt, "arguments", []) or []:
+            # openqasm3 stores gate parameters as Identifiers.
+            if kind(arg) == "Identifier":
+                arg_name = getattr(arg, "name", "")
+            else:
+                arg_name = getattr(getattr(arg, "name", None), "name", "")
+            if arg_name:
+                params.append(arg_name)
+        qubits: list[str] = []
+        for qb in getattr(stmt, "qubits", []) or []:
+            qb_name = getattr(qb, "name", "")
+            if qb_name:
+                qubits.append(qb_name)
+
+        if not name or not qubits:
+            # Fallback to serializer if we cannot confidently reconstruct header.
+            return [pad + dumps(stmt).strip()]
+
+        header = f"gate {name}"
+        if params:
+            header += "(" + ", ".join(params) + ")"
+        header += " " + ", ".join(qubits) + " {"
+
+        out: list[str] = [pad + header]
+        for inner in getattr(stmt, "body", []) or []:
+            out.extend(emit_stmt(inner, env, issues, indent + 1))
+        out.append(pad + "}")
+        return out
+    if k == "SubroutineDefinition":
+        name = getattr(getattr(stmt, "name", None), "name", "")
+        issues.append(Issue(stmt.span.start_line, stmt.span.end_line, k.lower(), f"drop subroutine definition {name or ''}".strip()))
+        return []
     if k in {"Program", "StatementOrScope"}:
         out: list[str] = []
         for inner in getattr(stmt, "statements", getattr(stmt, "block", [])):
@@ -545,22 +694,67 @@ def extract_qasm_version(source: str) -> str:
 
 
 def transpile_qasm(source: str) -> tuple[str, list[Issue], Any | None]:
-    # Check if source explicitly specifies QASM 3.1; if so, pass through without rewriting
+    # Respect explicit OpenQASM 3.1 sources: do not rewrite them to 3.0.
     version = extract_qasm_version(source)
-    if version == '3.1':
-        try:
-            program = parse(source)
-            return source, [], program
-        except Exception:
-            # If parsing fails, fall through to normal rewriting attempt
-            pass
-    
-    program = parse(source)
+    if version == "3.1":
+        program = parse(source)
+        return source, [], program
+
+    # Parse the *original* text first so span offsets match the editor.  This is
+    # important for include gray-highlighting and other UI range markers.
+    program_original: Any | None
+    try:
+        program_original = parse(source)
+    except Exception:
+        program_original = None
+
+    def strip_calibration_blocks_preserve_lines(text: str) -> str:
+        # Keep newline count stable by replacing removed lines with blank lines.
+        out_lines: list[str] = []
+        lines = text.splitlines(True)
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.lstrip()
+            if re.match(r"(?i)^defcalgrammar\b", stripped):
+                out_lines.append("\n" if line.endswith("\n") else "")
+                i += 1
+                continue
+            if re.match(r"(?i)^defcal\b", stripped):
+                brace = line.count("{") - line.count("}")
+                out_lines.append("\n" if line.endswith("\n") else "")
+                i += 1
+                while i < len(lines) and brace > 0:
+                    ln = lines[i]
+                    brace += ln.count("{") - ln.count("}")
+                    out_lines.append("\n" if ln.endswith("\n") else "")
+                    i += 1
+                continue
+            out_lines.append(line)
+            i += 1
+        return "".join(out_lines)
+
+    # For rewriting, fall back to a calibration-stripped parse if needed.
+    try:
+        program = program_original if program_original is not None else parse(source)
+    except Exception:
+        stripped = strip_calibration_blocks_preserve_lines(source)
+        # If the file has no version line at all, ensure the stripped form is parsable.
+        if not re.search(r"(?mi)^[ \t]*OPENQASM\b", stripped):
+            stripped = "OPENQASM 3.0;\n" + stripped
+        program = parse(stripped)
     env: dict[str, Any] = {}
     issues: list[Issue] = []
     lines: list[str] = []
     lines.append("OPENQASM 3.0;")
     for stmt in program.statements:
+        # Keep Qiskit-style input declarations verbatim.
+        if kind(stmt) == "IODeclaration":
+            try:
+                lines.append(dumps(stmt).strip())
+            except Exception:
+                issues.append(Issue(stmt.span.start_line, stmt.span.end_line, "iodeclaration", "cannot emit IO declaration"))
+            continue
         lines.extend(emit_stmt(stmt, env, issues, 0))
 
     def inferred_qubit_decl_lines() -> list[str]:
@@ -573,11 +767,15 @@ def transpile_qasm(source: str) -> tuple[str, list[Issue], Any | None]:
             k = kind(operand)
             if k == "Identifier":
                 name = getattr(operand, "name", "")
+                if name.startswith("$"):
+                    return None
                 return (name, 0) if name else None
             if k == "IndexedIdentifier":
                 name_obj = getattr(operand, "name", None)
                 name = getattr(name_obj, "name", "")
                 if not name:
+                    return None
+                if name.startswith("$"):
                     return None
                 max_index = 0
                 for index_group in getattr(operand, "indices", []):
@@ -590,6 +788,9 @@ def transpile_qasm(source: str) -> tuple[str, list[Issue], Any | None]:
             return None
 
         for stmt in getattr(program, "statements", []):
+            # Ignore calibration/OpenPulse sections when inferring qubit decls.
+            if kind(stmt) in {"CalibrationGrammarDeclaration", "CalibrationDefinition"}:
+                continue
             if kind(stmt) == "QuantumGateDefinition":
                 continue
             for operand in getattr(stmt, "qubits", []):
@@ -706,8 +907,8 @@ def transpile_qasm(source: str) -> tuple[str, list[Issue], Any | None]:
     rewritten = re.sub(r"\buint\b", "int", rewritten)
     rewritten = re.sub(r"\bstretch\s+\w+;\n?", "", rewritten)
     rewritten = re.sub(r"\bduration\s+\w+\s*=.*?;\n?", "", rewritten)
-    rewritten = re.sub(r"\bdelay\[[^\]]+\]\s+[^;]+;\n?", "", rewritten)
-    return rewritten, issues, program
+    # Do not strip delay instructions globally; Qiskit can represent delays.
+    return rewritten, issues, (program_original if program_original is not None else program)
 
 
 def node_iter(node: Any):
@@ -1153,9 +1354,11 @@ class MainWindow(QMainWindow):
         self.tree.setHeaderHidden(True)
         self.tree.itemSelectionChanged.connect(self.sync_editor_from_tree)
         self.output = QPlainTextEdit()
+        self.output.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self.output.setReadOnly(True)
         self.circuit = CircuitView()
         self.circuit_info = QPlainTextEdit()
+        self.circuit_info.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self.circuit_info.setReadOnly(True)
 
         circuit_panel = QSplitter(Qt.Orientation.Vertical)

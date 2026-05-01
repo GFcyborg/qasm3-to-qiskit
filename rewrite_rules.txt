@@ -6,24 +6,31 @@ Keep this file aligned with transpiler behavior in app.py.
 
 Sync markers (do not remove; used by app.py consistency check):
 - Insert OPENQASM 3.0 header when missing.
+- Normalize hardware qubit identifiers like $0 into a declared qubit register.
 - Expand include "stdgates.inc" into inline compatibility gate definitions.
 - Drop includes other than stdgates.inc.
 - Fold const declarations with statically known values into an environment.
 - Keep only classical declarations whose type is bit or bool.
 - Drop unsupported classical declarations that cannot be folded.
 - Unroll for loops only when range bounds are statically known.
+- Cap static loop unrolling to avoid output blow-ups.
 - Fold branching statements when condition is statically known.
 - Rewrite bit comparisons for qiskit-compatible conditions.
-- Drop calibration grammar/definitions, extern declarations, delays, stretch, and duration statements.
+- Drop calibration grammar/definitions, extern declarations, stretch, duration, and unsupported delay statements.
 - Unbox box statements by emitting only their inner body statements.
+- Drop subroutines, aliasing, and classical assignments not supported by qiskit importer.
+- Rewrite gate definitions by rewriting/unrolling their bodies when needed.
 - Keep reset, measurement, gate definitions, and quantum gate operations.
 - Substitute compile-time environment values into emitted statements.
 - Normalize uint tokens to int in rewritten output.
-- Strip residual stretch, duration, and delay forms in post-processing.
+- Strip residual stretch and duration forms in post-processing.
 
 INSERTIONS
 - Add OPENQASM 3.0; when the input source has no version header.
   Examples: adder.qasm:1-4, gateteleport.qasm:1-6.
+- Normalize hardware-qubit identifiers like `$0`/`$1` into a declared qubit register.
+  This makes the program parsable and keeps the rest of the rewrite pipeline consistent.
+  Example: bell_state_hw-regs.qasm:3-6.
 - Replace include "stdgates.inc" with inline compatibility gate definitions used by the qiskit importer.
   Examples: adder.qasm:4, teleport.qasm:3, qiskit-example.qasm:6.
 
@@ -34,6 +41,9 @@ FOLDING / UNROLLING / UNBOXING
   Examples: qiskit-example.qasm:12-13, arrays.qasm:9,13, scqec.qasm:14.
 - Unroll for loops only when range bounds are statically known.
   Examples: adder.qasm:33-41, ipe.qasm:22-28, scqec.qasm:36-44.
+- Cap static loop unrolling to avoid output blow-ups.
+  Large shot loops are dropped with a single issue rather than expanding thousands of iterations.
+  Examples: t1.qasm:25-47, scqec.qasm:81-99.
 - Fold if/else branches when conditions evaluate to compile-time booleans, or rewrite them when a qiskit-compatible condition can be emitted.
   Examples: adder.qasm:34-35, qec.qasm:23-25, teleport.qasm:20-21.
 - Unbox box blocks by emitting only their body statements.
@@ -54,6 +64,9 @@ OTHERS
   Examples: arrays.qasm:43-100, msd.qasm:85-154.
 - Records a rewrite issue when a statement cannot be emitted.
   Examples: vqe.qasm:16-23, scqec.qasm:16-18.
+- Rewrite gate definitions by rewriting/unrolling their bodies when needed.
+  This primarily targets static `for` loops inside `gate` bodies.
+  Example: vqe.qasm:25.
 
 **DROPPING**
 - Drop includes other than stdgates.inc.
@@ -62,3 +75,9 @@ OTHERS
   Examples: arrays.qasm:9,13, scqec.qasm:14.
 - Drop calibration grammar/definitions, extern declarations, delays, stretch, and duration statements.
   Examples: defcal.qasm:1,3-29, vqe.qasm:17-23, dd.qasm:7-21, t1.qasm:13,18,21,34,36.
+  Delays are kept only when they can be emitted without relying on dropped timing symbols;
+  otherwise they are dropped with a rewrite issue.
+  Examples: alignment.qasm:13,15, dd.qasm:13-21.
+- Drop subroutines, aliasing, and classical assignments not supported by qiskit importer.
+  Qiskit-qasm3-import does not currently load `def` subroutines, `let` alias statements, or most classical variable assignment patterns.
+  Examples: gateteleport.qasm:6-14, msd.qasm:22-83, ipe.qasm:31-33.
