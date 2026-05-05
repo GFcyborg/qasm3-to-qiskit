@@ -1198,6 +1198,9 @@ class CircuitView(QGraphicsView):
         # Whether the user has manually panned or zoomed the view.
         # If True, automatic re-fitting on resize is suppressed until reset.
         self._user_interacted = False
+        # Timestamp of the last user interaction (wheel/drag) to avoid
+        # immediate auto-fit while the user is actively interacting.
+        self._last_user_interaction: float = 0.0
         self.show_placeholder()
 
     def create_placeholder_pixmap(self, width: int = 400, height: int = 300) -> QPixmap:
@@ -1222,10 +1225,14 @@ class CircuitView(QGraphicsView):
         """Display a placeholder when no circuit is available."""
         self.scene().clear()
         placeholder = self.create_placeholder_pixmap(self.width() or 400, self.height() or 300)
-        self.scene().addPixmap(placeholder)
+        item = self.scene().addPixmap(placeholder)
+        # Ensure the scene rect matches the pixmap so fitInView works.
+        self.scene().setSceneRect(item.boundingRect())
         # Auto-fit only when the user hasn't manually interacted.
         if not self._user_interacted:
-            self._auto_fit_vertical_and_center()
+            self.resetTransform()
+            self.fitInView(item.boundingRect(), Qt.AspectRatioMode.KeepAspectRatio)
+            self.centerOn(item.boundingRect().center())
 
     def set_image(self, image_bytes: bytes) -> None:
         self.scene().clear()
@@ -1233,16 +1240,26 @@ class CircuitView(QGraphicsView):
         if not pixmap.loadFromData(image_bytes):
             self.show_placeholder()
             return
-        self.scene().addPixmap(pixmap)
-        # Auto-fit only when the user hasn't manually interacted.
-        if not self._user_interacted:
-            self._auto_fit_vertical_and_center()
+        item = self.scene().addPixmap(pixmap)
+        # Make sure the scene rect covers the pixmap so subsequent
+        # fitInView/centering is correct even if the scene was previously
+        # empty or had different extents.
+        self.scene().setSceneRect(item.boundingRect())
+        # When a new circuit image is loaded, reset to the automatic
+        # visualization: clear any previous manual interaction and
+        # auto-fit/center the new image so each circuit starts maximized.
+        self._user_interacted = False
+        self._last_user_interaction = 0.0
+        self.resetTransform()
+        self.fitInView(item.boundingRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        self.centerOn(item.boundingRect().center())
 
     def mousePressEvent(self, event: Any) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             self._dragging = True
             # mark as user interaction when starting to drag
             self._user_interacted = True
+            self._last_user_interaction = time.monotonic()
             pos = event.position().toPoint()
             self._drag_start_pos = (pos.x(), pos.y())
             self._scroll_bar_start = (
@@ -1259,6 +1276,7 @@ class CircuitView(QGraphicsView):
             dy = pos.y() - self._drag_start_pos[1]
             # any dragging counts as manual movement
             self._user_interacted = True
+            self._last_user_interaction = time.monotonic()
             self.horizontalScrollBar().setValue(self._scroll_bar_start[0] - dx)
             self.verticalScrollBar().setValue(self._scroll_bar_start[1] - dy)
         super().mouseMoveEvent(event)
@@ -1269,13 +1287,15 @@ class CircuitView(QGraphicsView):
             self._drag_start_pos = None
             self._scroll_bar_start = None
             self.setCursor(Qt.CursorShape.ArrowCursor)
+            self._last_user_interaction = time.monotonic()
         super().mouseReleaseEvent(event)
 
     def wheelEvent(self, event: Any) -> None:
         factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
-        # user zoom — mark interaction so auto-fit won't override
-        self._user_interacted = True
-        self.scale(factor, factor)
+        # Use the interactive scaler which enforces a minimum (fit) scale
+        # so zooming out doesn't make the image smaller than the fitted size.
+        self._interactive_scale(factor)
+        self._last_user_interaction = time.monotonic()
 
     def contextMenuEvent(self, event: Any) -> None:
         menu = QMenu(self)
@@ -1292,10 +1312,14 @@ class CircuitView(QGraphicsView):
         # (installed in MainWindow.__init__). When that area is resized, force
         # the circuit view to V-fit and H-center the image.
         if event.type() == QEvent.Type.Resize:
-            # Force auto-fit and reset manual-interaction flag so the view
-            # behaves as if not manually panned/zoomed.
-            self._user_interacted = False
-            self._auto_fit_vertical_and_center()
+            # When the runtime-results area is resized, re-fit the circuit
+            # view unless the user has very recently interacted (zoom/pan).
+            # This avoids snapping the view back to fit while the user is
+            # actively zooming.
+            now = time.monotonic()
+            if now - self._last_user_interaction > 0.25:
+                self._user_interacted = False
+                self._auto_fit_vertical_and_center()
         return super().eventFilter(obj, event)
 
     def _copy_image_to_clipboard(self) -> None:
@@ -1318,28 +1342,92 @@ class CircuitView(QGraphicsView):
             self._auto_fit_vertical_and_center()
 
     def _auto_fit_vertical_and_center(self) -> None:
-        """Scale the scene so its height fills the viewport and center it horizontally.
-
-        Keeps the original aspect ratio by using a uniform scale factor based
-        on the ratio of viewport height to scene height.
+        """Fit the scene into the viewport while preserving aspect ratio and
+        center it. Uses `fitInView` so the image will be as large as possible
+        while still fully visible after area resizes.
         """
         scene_rect = self.scene().itemsBoundingRect()
         if scene_rect.isNull():
             return
 
+        view_w = self.viewport().width()
         view_h = self.viewport().height()
-        scene_h = scene_rect.height()
-        if scene_h <= 0 or view_h <= 0:
+        if view_w <= 0 or view_h <= 0:
             return
 
-        # Reset any previous transform and scale uniformly to match viewport height.
+        # Reset any previous transform and fit the full scene into the view
+        # while keeping the original aspect ratio.
         self.resetTransform()
-        scale_factor = view_h / scene_h
-        self.scale(scale_factor, scale_factor)
-
-        # Center horizontally and vertically within the view (vertical centering
-        # is harmless when the image exactly fits the height).
+        self.fitInView(scene_rect, Qt.AspectRatioMode.KeepAspectRatio)
+        # Ensure the scene is centered in the view.
         self.centerOn(scene_rect.center())
+
+    def _current_uniform_scale(self) -> float:
+        """Return the current uniform X scale from the view transform."""
+        # QTransform is uniform because we always scale uniformly.
+        try:
+            val = float(self.transform().m11())
+        except Exception:
+            return 1.0
+        # Guard against degenerate or infinite values from repeated scaling.
+        if not math.isfinite(val):
+            return 1.0
+        return max(1e-6, min(val, 1e6))
+
+    def _compute_fit_scale(self) -> float:
+        """Compute the uniform scale at which the full scene fits the viewport.
+
+        This mirrors `fitInView` scaling: choose the smaller of width/height
+        scales so the entire scene is visible while preserving aspect ratio.
+        """
+        scene_rect = self.scene().itemsBoundingRect()
+        if scene_rect.isNull():
+            return 1.0
+        view_w = self.viewport().width()
+        view_h = self.viewport().height()
+        scene_w = scene_rect.width()
+        scene_h = scene_rect.height()
+        if scene_w <= 0 or scene_h <= 0 or view_w <= 0 or view_h <= 0:
+            return 1.0
+        scale_w = view_w / scene_w
+        scale_h = view_h / scene_h
+        return float(max(1e-6, min(scale_w, scale_h)))
+
+    def _interactive_scale(self, factor: float) -> None:
+        """Apply an interactive scale factor while preventing zoom-out below fit.
+
+        - Zoom-in (factor>1): always allowed and marks the view as manually
+          interacted so automatic re-fitting on resize is suppressed.
+        - Zoom-out (factor<1): allowed until the fitted scale is reached; once
+          the fitted scale would be exceeded (image fully visible), restore
+          the auto-fit state instead of scaling smaller.
+        """
+        # Compute current, target and fit scales.
+        cur = self._current_uniform_scale()
+        target = cur * factor
+        fit = self._compute_fit_scale()
+
+        # Allow tiny epsilon to avoid float noise when comparing scales.
+        eps = 1e-9
+
+        # Zoom-out behavior: do nothing if we're already at (or below) fit;
+        # if the requested target would go below fit, clamp to fit and
+        # re-enable auto-fit. This prevents any zoom-out beyond the fitted
+        # size.
+        if factor < 1.0:
+            if cur <= fit * (1.0 + eps):
+                # Already at or below fit, ignore further zoom-out.
+                return
+            if target <= fit * (1.0 + eps):
+                # Clamp to fit and restore auto-fit behavior.
+                self._user_interacted = False
+                self._auto_fit_vertical_and_center()
+                return
+
+        # For zoom-in (factor>1) or allowed zoom-out above fit, apply scale
+        # and mark as a manual interaction so it persists across resizes.
+        self.scale(factor, factor)
+        self._user_interacted = True
 
 
 class RulesDialog(QDialog):
@@ -1527,6 +1615,18 @@ class MainWindow(QMainWindow):
         zoom_out.setShortcut(QKeySequence.StandardKey.ZoomOut)
         zoom_out.triggered.connect(lambda: self.set_font_size(max(7, self.font_size - 1)))
         view_menu.addAction(zoom_out)
+        # Circuit view zoom controls
+        zoom_circ_in = QAction("Zoom circuit in", self)
+        zoom_circ_in.setShortcut("Ctrl++")
+        zoom_circ_in.triggered.connect(lambda: self.circuit._interactive_scale(1.15))
+        view_menu.addAction(zoom_circ_in)
+        zoom_circ_out = QAction("Zoom circuit out", self)
+        zoom_circ_out.setShortcut("Ctrl+-")
+        zoom_circ_out.triggered.connect(lambda: self.circuit._interactive_scale(1 / 1.15))
+        view_menu.addAction(zoom_circ_out)
+        reset_circ = QAction("Reset circuit zoom", self)
+        reset_circ.triggered.connect(lambda: (setattr(self.circuit, '_user_interacted', False), self.circuit._auto_fit_vertical_and_center()))
+        view_menu.addAction(reset_circ)
         reset_font = QAction("Reset font", self)
         reset_font.triggered.connect(lambda: self.set_font_size(10))
         view_menu.addAction(reset_font)
