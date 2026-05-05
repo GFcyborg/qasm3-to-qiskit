@@ -27,7 +27,7 @@ Keep changes small, tested, and aligned with the existing style.
 2. Test with the app:
 
    ```bash
-   python app.py
+   python run.py
    ```
 
 3. Keep the code style consistent.

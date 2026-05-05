@@ -41,7 +41,7 @@ git clone https://github.com/GFcyborg/qasm3-to-qiskit.git
 cd qasm3-to-qiskit
 bash setup.sh
 source .venv/bin/activate
-python app.py
+python run.py
 ```
 
 What `setup.sh` does:
@@ -59,7 +59,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
-python app.py
+python run.py
 ```
 
 ## Common actions
@@ -76,7 +76,7 @@ Before pushing to GitHub:
 
 ```bash
 source .venv/bin/activate
-python app.py
+python run.py
 bash check_portability_paths.sh
 ```
 

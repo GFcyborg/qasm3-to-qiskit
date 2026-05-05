@@ -2,9 +2,9 @@ QASM3 to Qiskit Rewrite Rules
 ==================================================
 
 This file is the single source of truth for the Help -> Rewrite rules dialog.
-Keep this file aligned with transpiler behavior in app.py.
+Keep this file aligned with transpiler behavior in run.py.
 
-Sync markers (do not remove; used by app.py consistency check):
+Sync markers (do not remove; used by run.py consistency check):
 - Insert OPENQASM 3.0 header when missing.
 - Normalize hardware qubit identifiers like $0 into a declared qubit register.
 - Expand include "stdgates.inc" into inline compatibility gate definitions.
