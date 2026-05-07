@@ -91,6 +91,18 @@ class Issue:
     detail: str
 
 
+def issue_span(node: Any) -> tuple[int, int]:
+    s = span(node)
+    if s is None:
+        return 0, 0
+    return int(getattr(s, "start_line", 0)), int(getattr(s, "end_line", 0))
+
+
+def append_issue(issues: list[Issue], node: Any, kind_name: str, detail: str) -> None:
+    start, end = issue_span(node)
+    issues.append(Issue(start, end, kind_name, detail))
+
+
 class AerRunSignals(QObject):
     finished = Signal(int, object, object, object, object)
 
@@ -460,7 +472,7 @@ def emit_stmt(stmt: Any, env: dict[str, Any], issues: list[Issue], indent: int =
         if value is not None:
             env[name] = value
             return []
-        issues.append(Issue(stmt.span.start_line, stmt.span.end_line, k.lower(), f"cannot fold constant {name}"))
+        append_issue(issues, stmt, k.lower(), f"cannot fold constant {name}")
         return []
     if k == "ClassicalDeclaration":
         if is_supported_decl(stmt):
@@ -470,7 +482,7 @@ def emit_stmt(stmt: Any, env: dict[str, Any], issues: list[Issue], indent: int =
         if value is not None:
             env[name] = value
             return []
-        issues.append(Issue(stmt.span.start_line, stmt.span.end_line, k.lower(), f"drop unsupported declaration {name}"))
+        append_issue(issues, stmt, k.lower(), f"drop unsupported declaration {name}")
         return []
     if k == "ClassicalAssignment":
         lvalue = getattr(stmt, "lvalue", None)
@@ -483,7 +495,7 @@ def emit_stmt(stmt: Any, env: dict[str, Any], issues: list[Issue], indent: int =
         # importer, and attempting to substitute folded Python lists will
         # produce invalid OpenQASM.  Drop these gracefully.
         if lvalue_kind == "IndexExpression":
-            issues.append(Issue(stmt.span.start_line, stmt.span.end_line, k.lower(), "drop array/slice assignment (not supported by qiskit importer)"))
+            append_issue(issues, stmt, k.lower(), "drop array/slice assignment (not supported by qiskit importer)")
             return []
 
         # If this is a simple compile-time update, fold it into the environment
@@ -532,7 +544,7 @@ def emit_stmt(stmt: Any, env: dict[str, Any], issues: list[Issue], indent: int =
 
         # Qiskit-qasm3-import does not support `def` subroutines; drop calls.
         if rvalue_kind == "FunctionCall":
-            issues.append(Issue(stmt.span.start_line, stmt.span.end_line, k.lower(), "drop subroutine call assignment (not supported by qiskit importer)"))
+            append_issue(issues, stmt, k.lower(), "drop subroutine call assignment (not supported by qiskit importer)")
             return []
 
         # Otherwise, keep the statement (this is needed for dynamic-circuit style
@@ -543,19 +555,19 @@ def emit_stmt(stmt: Any, env: dict[str, Any], issues: list[Issue], indent: int =
             # verbatim unless they were folded above.
             return [pad + dumps(stmt).strip()]
         except Exception:
-            issues.append(Issue(stmt.span.start_line, stmt.span.end_line, k.lower(), "cannot emit classical assignment"))
+            append_issue(issues, stmt, k.lower(), "cannot emit classical assignment")
             return []
     if k == "ForInLoop":
         values = range_values(getattr(stmt, "set_declaration", None), env)
         if values is None:
-            issues.append(Issue(stmt.span.start_line, stmt.span.end_line, k.lower(), "loop range is not statically known"))
+            append_issue(issues, stmt, k.lower(), "loop range is not statically known")
             return []
         # Avoid output blow-ups when the source uses large shot loops.
         # Qiskit importer can represent loops, but it cannot parse most of the
         # classical machinery that tends to appear around these examples anyway.
         MAX_UNROLL = 256
         if len(values) > MAX_UNROLL:
-            issues.append(Issue(stmt.span.start_line, stmt.span.end_line, k.lower(), f"loop range too large to unroll ({len(values)} > {MAX_UNROLL})"))
+            append_issue(issues, stmt, k.lower(), f"loop range too large to unroll ({len(values)} > {MAX_UNROLL})")
             return []
         out: list[str] = []
         ident = getattr(getattr(stmt, "identifier", None), "name", "")
@@ -575,7 +587,7 @@ def emit_stmt(stmt: Any, env: dict[str, Any], issues: list[Issue], indent: int =
             return out
         cond_text = rewrite_condition_text(getattr(stmt, "condition", None), env)
         if cond_text is None:
-            issues.append(Issue(stmt.span.start_line, stmt.span.end_line, k.lower(), "condition cannot be rewritten for qiskit"))
+            append_issue(issues, stmt, k.lower(), "condition cannot be rewritten for qiskit")
             return []
         cond_text = subst_env(cond_text, env)
         out = [pad + f"if ({cond_text}) {{"]
@@ -602,7 +614,7 @@ def emit_stmt(stmt: Any, env: dict[str, Any], issues: list[Issue], indent: int =
         "ExpressionStatement",
         "QuantumDelay",
     }:
-        issues.append(Issue(stmt.span.start_line, stmt.span.end_line, k.lower(), "not supported by qiskit importer"))
+        append_issue(issues, stmt, k.lower(), "not supported by qiskit importer")
         return []
     if k == "DelayInstruction":
         # Drop delays whose duration depends on timing constructs we do not keep
@@ -610,12 +622,12 @@ def emit_stmt(stmt: Any, env: dict[str, Any], issues: list[Issue], indent: int =
         duration_expr = getattr(stmt, "duration", None)
         if duration_expr is not None:
             if kind(duration_expr) == "Identifier" and getattr(duration_expr, "name", "") not in env:
-                issues.append(Issue(stmt.span.start_line, stmt.span.end_line, k.lower(), "drop delay (duration depends on dropped timing symbol)"))
+                append_issue(issues, stmt, k.lower(), "drop delay (duration depends on dropped timing symbol)")
                 return []
             if contains_timing_constructs(duration_expr):
-                issues.append(Issue(stmt.span.start_line, stmt.span.end_line, k.lower(), "drop delay (unsupported timing construct)"))
+                append_issue(issues, stmt, k.lower(), "drop delay (unsupported timing construct)")
                 return []
-        issues.append(Issue(stmt.span.start_line, stmt.span.end_line, k.lower(), "drop delay (not supported by qiskit importer)"))
+        append_issue(issues, stmt, k.lower(), "drop delay (not supported by qiskit importer)")
         return []
     if k == "QuantumReset":
         return [pad + subst_env(dumps(stmt).strip(), env)]
@@ -661,7 +673,7 @@ def emit_stmt(stmt: Any, env: dict[str, Any], issues: list[Issue], indent: int =
         return out
     if k == "SubroutineDefinition":
         name = getattr(getattr(stmt, "name", None), "name", "")
-        issues.append(Issue(stmt.span.start_line, stmt.span.end_line, k.lower(), f"drop subroutine definition {name or ''}".strip()))
+        append_issue(issues, stmt, k.lower(), f"drop subroutine definition {name or ''}".strip())
         return []
     if k in {"Program", "StatementOrScope"}:
         out: list[str] = []
@@ -673,7 +685,7 @@ def emit_stmt(stmt: Any, env: dict[str, Any], issues: list[Issue], indent: int =
     try:
         return [pad + subst_env(dumps(stmt).strip(), env)]
     except Exception:
-        issues.append(Issue(stmt.span.start_line, stmt.span.end_line, k.lower(), "cannot emit statement"))
+        append_issue(issues, stmt, k.lower(), "cannot emit statement")
         return []
 
 
@@ -754,7 +766,7 @@ def transpile_qasm(source: str) -> tuple[str, list[Issue], Any | None]:
             try:
                 lines.append(dumps(stmt).strip())
             except Exception:
-                issues.append(Issue(stmt.span.start_line, stmt.span.end_line, "iodeclaration", "cannot emit IO declaration"))
+                append_issue(issues, stmt, "iodeclaration", "cannot emit IO declaration")
             continue
         lines.extend(emit_stmt(stmt, env, issues, 0))
 
