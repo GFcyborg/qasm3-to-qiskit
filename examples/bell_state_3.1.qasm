@@ -1,5 +1,5 @@
 // Simple Bell state circuit
-OPENQASM 3;
+OPENQASM 3.1;
 include "stdgates.inc";
 
 qubit[2] q;
