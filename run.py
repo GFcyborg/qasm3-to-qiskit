@@ -458,7 +458,300 @@ def contains_timing_constructs(node: Any) -> bool:
     return kind(node) in {"DurationOf"}
 
 
-def emit_stmt(stmt: Any, env: dict[str, Any], issues: list[Issue], indent: int = 0) -> list[str]:
+def subroutine_param_names(subroutine: Any) -> list[str]:
+    names: list[str] = []
+    for arg in getattr(subroutine, "arguments", []) or []:
+        arg_name = getattr(getattr(arg, "name", None), "name", "")
+        if arg_name:
+            names.append(arg_name)
+    return names
+
+
+def substitute_names(text: str, mapping: dict[str, str]) -> str:
+    out = text
+    for name, value in sorted(mapping.items(), key=lambda item: -len(item[0])):
+        out = re.sub(rf"\b{name}\b", value, out)
+    return out
+
+
+def subroutine_is_inlineable(subroutine: Any) -> bool:
+    def stmt_inlineable(stmt: Any) -> bool:
+        k = kind(stmt)
+        if k in {"QuantumGate", "QuantumMeasurementStatement", "QuantumReset", "ReturnStatement"}:
+            return True
+        if k == "Box":
+            return all(stmt_inlineable(inner) for inner in (getattr(stmt, "body", []) or []))
+        return False
+
+    return all(stmt_inlineable(stmt) for stmt in (getattr(subroutine, "body", []) or []))
+
+
+def majority_vote_pairs_from_subroutine(subroutine: Any, arg_map: dict[str, str]) -> list[tuple[str, str]] | None:
+    param_names = subroutine_param_names(subroutine)
+    if len(param_names) != 1:
+        return None
+
+    body = getattr(subroutine, "body", []) or []
+    return_stmt = next((stmt for stmt in body if kind(stmt) == "ReturnStatement"), None)
+    if return_stmt is None:
+        return None
+    ret_name = getattr(getattr(return_stmt, "expression", None), "name", "")
+    if not ret_name:
+        return None
+
+    pairs: list[tuple[str, str]] = []
+    for stmt in body:
+        if kind(stmt) != "BranchingStatement":
+            continue
+        if getattr(stmt, "else_block", []):
+            return None
+        if_block = getattr(stmt, "if_block", [])
+        if len(if_block) != 1 or kind(if_block[0]) != "ClassicalAssignment":
+            return None
+        assign = if_block[0]
+        l_name = getattr(getattr(assign, "lvalue", None), "name", "")
+        r_node = getattr(assign, "rvalue", None)
+        r_val = getattr(r_node, "value", None) if kind(r_node) == "IntegerLiteral" else None
+        op = getattr(getattr(assign, "op", None), "name", None) or str(getattr(assign, "op", ""))
+        if l_name != ret_name or op != "=" or r_val != 1:
+            return None
+
+        cond_expr = getattr(stmt, "condition", None)
+        if kind(cond_expr) != "BinaryExpression":
+            return None
+        cond_op = getattr(cond_expr, "op", None)
+        cond_op_name = getattr(cond_op, "name", None) if hasattr(cond_op, "name") else str(cond_op)
+        if cond_op_name != "&":
+            return None
+
+        lhs = getattr(cond_expr, "lhs", None)
+        rhs = getattr(cond_expr, "rhs", None)
+        if lhs is None or rhs is None:
+            return None
+        try:
+            lhs_text = substitute_names(dumps(lhs).strip().rstrip(";"), arg_map)
+            rhs_text = substitute_names(dumps(rhs).strip().rstrip(";"), arg_map)
+        except Exception:
+            return None
+        pairs.append((lhs_text, rhs_text))
+
+    return pairs if pairs else None
+
+
+def logical_meas_call_pattern(
+    call: Any,
+    subroutines: dict[str, Any],
+    inline_depth: int,
+) -> tuple[list[str], list[tuple[str, str]]] | None:
+    name = getattr(getattr(call, "name", None), "name", "")
+    if name not in subroutines:
+        return None
+
+    subroutine = subroutines[name]
+    param_names = subroutine_param_names(subroutine)
+    call_args = getattr(call, "arguments", []) or []
+    if len(param_names) != 1 or len(call_args) != 1:
+        return None
+
+    body = getattr(subroutine, "body", []) or []
+    decls = [stmt for stmt in body if kind(stmt) == "ClassicalDeclaration"]
+    meas = next((stmt for stmt in body if kind(stmt) == "QuantumMeasurementStatement"), None)
+    vote_assign = next((stmt for stmt in body if kind(stmt) == "ClassicalAssignment"), None)
+    ret_stmt = next((stmt for stmt in body if kind(stmt) == "ReturnStatement"), None)
+    if meas is None or vote_assign is None or ret_stmt is None:
+        return None
+
+    target_name = getattr(getattr(meas, "target", None), "name", "")
+    target_decl = next((stmt for stmt in decls if getattr(getattr(stmt, "identifier", None), "name", "") == target_name), None)
+    if target_decl is None:
+        return None
+
+    rvalue = getattr(vote_assign, "rvalue", None)
+    if kind(rvalue) != "FunctionCall":
+        return None
+    vote_name = getattr(getattr(rvalue, "name", None), "name", "")
+    if vote_name not in subroutines:
+        return None
+    vote_args = getattr(rvalue, "arguments", []) or []
+    if len(vote_args) != 1:
+        return None
+
+    vote_param = subroutine_param_names(subroutines[vote_name])
+    if len(vote_param) != 1:
+        return None
+
+    span_obj = getattr(call, "span", None)
+    call_id = int(getattr(span_obj, "start_line", 0) or 0)
+    temp_name = f"tmp{call_id}"
+
+    try:
+        decl_text = dumps(target_decl).strip().rstrip(";")
+        decl_text = re.sub(rf"\b{re.escape(target_name)}\b", temp_name, decl_text)
+        arg_text = dumps(call_args[0]).strip().rstrip(";")
+        meas_text = dumps(meas).strip().rstrip(";")
+        meas_text = re.sub(rf"\b{re.escape(param_names[0])}\b", arg_text, meas_text)
+        meas_text = re.sub(rf"\b{re.escape(target_name)}\b", temp_name, meas_text)
+    except Exception:
+        return None
+
+    pairs = majority_vote_pairs_from_subroutine(
+        subroutines[vote_name],
+        {vote_param[0]: temp_name},
+    )
+    if pairs is None:
+        return None
+
+    return [decl_text + ";", meas_text + ";"], pairs
+
+
+def inline_call_assignment_if_pattern(
+    assign_stmt: Any,
+    next_stmt: Any,
+    env: dict[str, Any],
+    issues: list[Issue],
+    indent: int,
+    subroutines: dict[str, Any],
+    inline_depth: int,
+) -> list[str] | None:
+    if kind(assign_stmt) != "ClassicalAssignment" or kind(next_stmt) != "BranchingStatement":
+        return None
+    lvalue = getattr(assign_stmt, "lvalue", None)
+    rvalue = getattr(assign_stmt, "rvalue", None)
+    if kind(lvalue) != "Identifier" or kind(rvalue) != "FunctionCall":
+        return None
+    assigned_name = getattr(lvalue, "name", "")
+    if not assigned_name:
+        return None
+
+    cond = getattr(next_stmt, "condition", None)
+    cond_kind = kind(cond)
+    compare_true = False
+    if cond_kind == "Identifier" and getattr(cond, "name", "") == assigned_name:
+        compare_true = True
+    elif cond_kind == "BinaryExpression":
+        op = getattr(cond, "op", None)
+        op_name = getattr(op, "name", None) if hasattr(op, "name") else str(op)
+        lhs = getattr(cond, "lhs", None)
+        rhs = getattr(cond, "rhs", None)
+        lhs_name = getattr(lhs, "name", "") if kind(lhs) == "Identifier" else ""
+        if op_name == "==" and lhs_name == assigned_name and kind(rhs) == "IntegerLiteral":
+            compare_true = int(getattr(rhs, "value", 0)) == 1
+
+    # This targeted lowering is only safe for a positive branch with no else.
+    if not compare_true or getattr(next_stmt, "else_block", []):
+        return None
+
+    # Keep this strict: we only duplicate a single-Z correction block.
+    if_block = getattr(next_stmt, "if_block", [])
+    if len(if_block) != 1 or kind(if_block[0]) != "QuantumGate":
+        return None
+    gate_stmt = if_block[0]
+    gate_name = getattr(getattr(gate_stmt, "name", None), "name", "")
+    if gate_name != "z":
+        return None
+
+    lowered = logical_meas_call_pattern(rvalue, subroutines, inline_depth)
+    if lowered is None:
+        return None
+    prelude, pairs = lowered
+
+    pad = "  " * indent
+    out: list[str] = [pad + line for line in prelude]
+    for lhs_text, rhs_text in pairs:
+        out.append(pad + f"if ({lhs_text} == true) {{")
+        out.append(pad + f"  if ({rhs_text} == true) {{")
+        out.extend(emit_stmt(gate_stmt, env, issues, indent + 2, subroutines=subroutines, inline_depth=inline_depth))
+        out.append(pad + "  }")
+        out.append(pad + "}")
+    return out
+
+
+def inline_subroutine_call(
+    subroutine: Any,
+    call: Any,
+    assign_target: str | None,
+    env: dict[str, Any],
+    issues: list[Issue],
+    indent: int,
+    subroutines: dict[str, Any],
+    inline_depth: int,
+) -> list[str] | None:
+    MAX_INLINE_DEPTH = 6
+    if inline_depth >= MAX_INLINE_DEPTH:
+        append_issue(issues, call, "functioncall", f"cannot inline subroutine (depth>{MAX_INLINE_DEPTH})")
+        return None
+
+    if not subroutine_is_inlineable(subroutine):
+        append_issue(issues, call, "functioncall", "cannot inline subroutine (body uses unsupported classical flow)")
+        return None
+
+    param_names = subroutine_param_names(subroutine)
+    call_args = getattr(call, "arguments", []) or []
+    if len(param_names) != len(call_args):
+        append_issue(issues, call, "functioncall", "cannot inline subroutine (argument count mismatch)")
+        return None
+
+    arg_texts: dict[str, str] = {}
+    for name, arg in zip(param_names, call_args):
+        try:
+            arg_texts[name] = dumps(arg).strip().rstrip(";")
+        except Exception:
+            append_issue(issues, call, "functioncall", "cannot inline subroutine (cannot serialize argument)")
+            return None
+
+    local_renames: dict[str, str] = {}
+    call_name = getattr(getattr(call, "name", None), "name", "sub")
+    for body_stmt in getattr(subroutine, "body", []) or []:
+        if kind(body_stmt) == "ClassicalDeclaration":
+            ident = getattr(getattr(body_stmt, "identifier", None), "name", "")
+            if ident and ident not in arg_texts:
+                local_renames[ident] = f"tmp{inline_depth}_{ident}"
+
+    name_map = dict(arg_texts)
+    name_map.update(local_renames)
+
+    out: list[str] = []
+    for body_stmt in getattr(subroutine, "body", []) or []:
+        if kind(body_stmt) == "ReturnStatement":
+            if assign_target is None:
+                continue
+            expr = getattr(body_stmt, "expression", None)
+            if expr is None:
+                append_issue(issues, body_stmt, "returnstatement", "cannot inline return without value")
+                return None
+            try:
+                expr_text = dumps(expr).strip().rstrip(";")
+            except Exception:
+                append_issue(issues, body_stmt, "returnstatement", "cannot inline return expression")
+                return None
+            mapped_expr = substitute_names(expr_text, name_map)
+            if mapped_expr != assign_target:
+                out.append(("  " * indent) + f"{assign_target} = {mapped_expr};")
+            continue
+
+        inner_lines = emit_stmt(
+            body_stmt,
+            dict(env),
+            issues,
+            indent,
+            subroutines=subroutines,
+            inline_depth=inline_depth + 1,
+        )
+        out.extend(substitute_names(line, name_map) for line in inner_lines)
+    return out
+
+
+def emit_stmt(
+    stmt: Any,
+    env: dict[str, Any],
+    issues: list[Issue],
+    indent: int = 0,
+    *,
+    subroutines: dict[str, Any] | None = None,
+    inline_depth: int = 0,
+) -> list[str]:
+    if subroutines is None:
+        subroutines = {}
     pad = "  " * indent
     k = kind(stmt)
     if k == "Include":
@@ -542,9 +835,25 @@ def emit_stmt(stmt: Any, env: dict[str, Any], issues: list[Issue], indent: int =
                     except Exception:
                         pass
 
-        # Qiskit-qasm3-import does not support `def` subroutines; drop calls.
+        # Try to inline `def` subroutine calls when possible.
         if rvalue_kind == "FunctionCall":
-            append_issue(issues, stmt, k.lower(), "drop subroutine call assignment (not supported by qiskit importer)")
+            name = getattr(getattr(rvalue, "name", None), "name", "")
+            if name and name in subroutines and lvalue_kind == "Identifier":
+                assign_target = getattr(lvalue, "name", "")
+                if assign_target:
+                    inlined = inline_subroutine_call(
+                        subroutines[name],
+                        rvalue,
+                        assign_target,
+                        env,
+                        issues,
+                        indent,
+                        subroutines,
+                        inline_depth,
+                    )
+                    if inlined is not None:
+                        return inlined
+            append_issue(issues, stmt, k.lower(), "drop subroutine call assignment (cannot inline)")
             return []
 
         # Otherwise, keep the statement (this is needed for dynamic-circuit style
@@ -575,7 +884,7 @@ def emit_stmt(stmt: Any, env: dict[str, Any], issues: list[Issue], indent: int =
             next_env = dict(env)
             next_env[ident] = value
             for inner in getattr(stmt, "block", []):
-                out.extend(emit_stmt(inner, next_env, issues, indent))
+                out.extend(emit_stmt(inner, next_env, issues, indent, subroutines=subroutines, inline_depth=inline_depth))
         return out
     if k == "BranchingStatement":
         cond_value = eval_node(getattr(stmt, "condition", None), env)
@@ -583,7 +892,7 @@ def emit_stmt(stmt: Any, env: dict[str, Any], issues: list[Issue], indent: int =
             block = getattr(stmt, "if_block" if cond_value else "else_block", [])
             out: list[str] = []
             for inner in block:
-                out.extend(emit_stmt(inner, env, issues, indent))
+                out.extend(emit_stmt(inner, env, issues, indent, subroutines=subroutines, inline_depth=inline_depth))
             return out
         cond_text = rewrite_condition_text(getattr(stmt, "condition", None), env)
         if cond_text is None:
@@ -592,18 +901,39 @@ def emit_stmt(stmt: Any, env: dict[str, Any], issues: list[Issue], indent: int =
         cond_text = subst_env(cond_text, env)
         out = [pad + f"if ({cond_text}) {{"]
         for inner in getattr(stmt, "if_block", []):
-            out.extend(emit_stmt(inner, env, issues, indent + 1))
+            out.extend(emit_stmt(inner, env, issues, indent + 1, subroutines=subroutines, inline_depth=inline_depth))
         if getattr(stmt, "else_block", []):
             out.append(pad + "} else {")
             for inner in getattr(stmt, "else_block", []):
-                out.extend(emit_stmt(inner, env, issues, indent + 1))
+                out.extend(emit_stmt(inner, env, issues, indent + 1, subroutines=subroutines, inline_depth=inline_depth))
         out.append(pad + "}")
         return out
     if k == "Box":
         out: list[str] = []
         for inner in getattr(stmt, "body", []):
-            out.extend(emit_stmt(inner, env, issues, indent))
+            out.extend(emit_stmt(inner, env, issues, indent, subroutines=subroutines, inline_depth=inline_depth))
         return out
+    if k == "ExpressionStatement":
+        expr = getattr(stmt, "expression", None)
+        if kind(expr) == "FunctionCall":
+            name = getattr(getattr(expr, "name", None), "name", "")
+            if name and name in subroutines:
+                inlined = inline_subroutine_call(
+                    subroutines[name],
+                    expr,
+                    None,
+                    env,
+                    issues,
+                    indent,
+                    subroutines,
+                    inline_depth,
+                )
+                if inlined is not None:
+                    return inlined
+            append_issue(issues, stmt, k.lower(), "drop subroutine call statement (cannot inline)")
+            return []
+        append_issue(issues, stmt, k.lower(), "not supported by qiskit importer")
+        return []
     if k in {
         "CalibrationGrammarDeclaration",
         "CalibrationDefinition",
@@ -611,7 +941,6 @@ def emit_stmt(stmt: Any, env: dict[str, Any], issues: list[Issue], indent: int =
         "StretchDeclaration",
         "DurationDeclaration",
         "ReturnStatement",
-        "ExpressionStatement",
         "QuantumDelay",
     }:
         append_issue(issues, stmt, k.lower(), "not supported by qiskit importer")
@@ -668,17 +997,35 @@ def emit_stmt(stmt: Any, env: dict[str, Any], issues: list[Issue], indent: int =
 
         out: list[str] = [pad + header]
         for inner in getattr(stmt, "body", []) or []:
-            out.extend(emit_stmt(inner, env, issues, indent + 1))
+            out.extend(emit_stmt(inner, env, issues, indent + 1, subroutines=subroutines, inline_depth=inline_depth))
         out.append(pad + "}")
         return out
     if k == "SubroutineDefinition":
-        name = getattr(getattr(stmt, "name", None), "name", "")
-        append_issue(issues, stmt, k.lower(), f"drop subroutine definition {name or ''}".strip())
+        # Definitions are dropped from output after being registered for inlining.
         return []
     if k in {"Program", "StatementOrScope"}:
         out: list[str] = []
-        for inner in getattr(stmt, "statements", getattr(stmt, "block", [])):
-            out.extend(emit_stmt(inner, env, issues, indent))
+        block = list(getattr(stmt, "statements", getattr(stmt, "block", [])))
+        i = 0
+        while i < len(block):
+            current = block[i]
+            nxt = block[i + 1] if i + 1 < len(block) else None
+            if nxt is not None:
+                lowered = inline_call_assignment_if_pattern(
+                    current,
+                    nxt,
+                    env,
+                    issues,
+                    indent,
+                    subroutines,
+                    inline_depth,
+                )
+                if lowered is not None:
+                    out.extend(lowered)
+                    i += 2
+                    continue
+            out.extend(emit_stmt(current, env, issues, indent, subroutines=subroutines, inline_depth=inline_depth))
+            i += 1
         return out
     if k == "Annotation":
         return []
@@ -759,16 +1106,46 @@ def transpile_qasm(source: str) -> tuple[str, list[Issue], Any | None]:
     env: dict[str, Any] = {}
     issues: list[Issue] = []
     lines: list[str] = []
+    subroutines: dict[str, Any] = {}
+    for stmt in getattr(program, "statements", []):
+        if kind(stmt) == "SubroutineDefinition":
+            name = getattr(getattr(stmt, "name", None), "name", "")
+            if name:
+                subroutines[name] = stmt
+
     lines.append("OPENQASM 3.0;")
-    for stmt in program.statements:
+    stmts = list(program.statements)
+    i = 0
+    while i < len(stmts):
+        stmt = stmts[i]
+        nxt = stmts[i + 1] if i + 1 < len(stmts) else None
+
         # Keep Qiskit-style input declarations verbatim.
         if kind(stmt) == "IODeclaration":
             try:
                 lines.append(dumps(stmt).strip())
             except Exception:
                 append_issue(issues, stmt, "iodeclaration", "cannot emit IO declaration")
+            i += 1
             continue
-        lines.extend(emit_stmt(stmt, env, issues, 0))
+
+        if nxt is not None:
+            lowered = inline_call_assignment_if_pattern(
+                stmt,
+                nxt,
+                env,
+                issues,
+                0,
+                subroutines,
+                0,
+            )
+            if lowered is not None:
+                lines.extend(lowered)
+                i += 2
+                continue
+
+        lines.extend(emit_stmt(stmt, env, issues, 0, subroutines=subroutines, inline_depth=0))
+        i += 1
 
     def inferred_qubit_decl_lines() -> list[str]:
         if any(kind(stmt) == "QubitDeclaration" for stmt in getattr(program, "statements", [])):
@@ -900,7 +1277,9 @@ def transpile_qasm(source: str) -> tuple[str, list[Issue], Any | None]:
     if hw_matches:
         hw_indices = [int(x) for x in hw_matches]
         max_hw = max(hw_indices)
-        hw_name = "__hw"
+        # Prefer a name that does not start with underscores so the Qiskit
+        # importer does not add an `esc` prefix when creating registers.
+        hw_name = "hw"
         # Ensure the chosen name does not collide with existing tokens in
         # the emitted text.
         while _re.search(rf"\b{_re.escape(hw_name)}\b", joined):
@@ -917,24 +1296,27 @@ def transpile_qasm(source: str) -> tuple[str, list[Issue], Any | None]:
     if qubit_decl_lines:
         out_lines = joined.splitlines()
         insert_at = 0
-        in_gate_def = False
-        for idx, line in enumerate(out_lines):
-            stripped = line.strip()
+        idx = 0
+        if out_lines and out_lines[0].strip().upper().startswith("OPENQASM"):
+            insert_at = 1
+            idx = 1
+
+        while idx < len(out_lines):
+            stripped = out_lines[idx].strip()
             if not stripped:
+                idx += 1
                 continue
-            if stripped.upper().startswith("OPENQASM"):
+            if not stripped.startswith("gate "):
+                break
+
+            brace_depth = stripped.count("{") - stripped.count("}")
+            insert_at = idx + 1
+            idx += 1
+            while idx < len(out_lines) and brace_depth > 0:
+                line = out_lines[idx]
+                brace_depth += line.count("{") - line.count("}")
                 insert_at = idx + 1
-                continue
-            if in_gate_def:
-                if not line[: len(line) - len(line.lstrip())] and stripped == "}":
-                    insert_at = idx + 1
-                    in_gate_def = False
-                continue
-            if stripped.startswith("gate "):
-                in_gate_def = True
-                insert_at = idx + 1
-                continue
-            break
+                idx += 1
         out_lines[insert_at:insert_at] = qubit_decl_lines
         joined = "\n".join(out_lines)
 
@@ -1928,7 +2310,14 @@ class MainWindow(QMainWindow):
         )
 
     def draw_circuit(self, circuit: Any) -> None:
-        fig = cast(Any, circuit_drawer(circuit, output="mpl"))
+        fig = cast(Any, circuit_drawer(
+            circuit,
+            output="mpl",
+            fold=500,
+            vertical_compression="low",
+            cregbundle=False,
+            expr_len=60,
+        ))
         buf = BytesIO()
         fig.savefig(buf, format="png", bbox_inches="tight", dpi=140)
         try:

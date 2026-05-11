@@ -14,9 +14,9 @@ const int[32] n = d**2;      // number of code qubits
 
 uint[32] failures;  // number of observed failures
 
-def zfirst(creg[n - 1] p0, int[32] p1, int[32] p2) {}
-def send(creg[n -1 ] p0, int[32] p1, int[32] p2, int[32] p3) {}
-def zlast(creg[n] p0, int[32] p1, int[32] p2) -> bit {
+def zfirst(bit[n - 1] p0, int[32] p1, int[32] p2) {}
+def send(bit[n -1 ] p0, int[32] p1, int[32] p2, int[32] p3) {}
+def zlast(bit[n] p0, int[32] p1, int[32] p2) -> bit {
   return 0;
 }
 
