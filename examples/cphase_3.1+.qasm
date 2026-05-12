@@ -9,6 +9,10 @@ gate MY_cphase(θ) a, b
   CX a, b;
   U(0, 0, θ / 2) b;
 }
+
 qubit[2] q;
-MY_cphase(π / 2) q[0], q[1];
+bit[2] c;
+MY_cphase(2 * π) q[0], q[1];
 cphase(π / 2) q[0], q[1];
+
+c = measure q;
