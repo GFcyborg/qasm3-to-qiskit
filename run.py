@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import concurrent.futures
+import json
 import multiprocessing
 import math
 import re
@@ -16,6 +17,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urlparse
+from urllib import request
 
 import PySide6
 import qiskit_qasm3_import
@@ -126,6 +128,90 @@ class AerRunWorker(QRunnable):
         self.signals.finished.emit(self.token, self.circuit, counts, error, run_timestamp)
 
 
+class VersionCheckSignals(QObject):
+    finished = Signal(str)
+
+
+class VersionCheckWorker(QRunnable):
+    def __init__(self, pyside6_version: str, openqasm3_version: str, antlr4_version: str,
+                 matplotlib_version: str, pylatexenc_version: str, qiskit_version: str,
+                 qiskit_aer_version: str, qiskit_qasm3_import_version: str, shots: int) -> None:
+        super().__init__()
+        self.pyside6_version = pyside6_version
+        self.openqasm3_version = openqasm3_version
+        self.antlr4_version = antlr4_version
+        self.matplotlib_version = matplotlib_version
+        self.pylatexenc_version = pylatexenc_version
+        self.qiskit_version = qiskit_version
+        self.qiskit_aer_version = qiskit_aer_version
+        self.qiskit_qasm3_import_version = qiskit_qasm3_import_version
+        self.shots = shots
+        self.signals = VersionCheckSignals()
+
+    def run(self) -> None:
+        lines = [
+            f"Python: {sys.version.split()[0]}",
+            f"Python executable: {sys.executable}",
+            "",
+            "Library versions:",
+        ]
+        try:
+            lines.append(format_version_status("PySide6", self.pyside6_version))
+        except Exception:
+            lines.append(f"PySide6: {self.pyside6_version}")
+        try:
+            lines.append(format_version_status("openqasm3", self.openqasm3_version))
+        except Exception:
+            lines.append(f"openqasm3: {self.openqasm3_version}")
+        try:
+            lines.append(format_version_status("antlr4-python3-runtime", self.antlr4_version))
+        except Exception:
+            lines.append(f"antlr4-python3-runtime: {self.antlr4_version}")
+        try:
+            lines.append(format_version_status("matplotlib", self.matplotlib_version))
+        except Exception:
+            lines.append(f"matplotlib: {self.matplotlib_version}")
+        try:
+            lines.append(format_version_status("pylatexenc", self.pylatexenc_version))
+        except Exception:
+            lines.append(f"pylatexenc: {self.pylatexenc_version}")
+        lines.extend(["", "Qiskit runtime:"])
+        try:
+            lines.append(f"  {format_version_status('qiskit', self.qiskit_version)}")
+        except Exception:
+            lines.append(f"  qiskit: {self.qiskit_version}")
+        try:
+            lines.append(f"  {format_version_status('qiskit-aer', self.qiskit_aer_version)}")
+        except Exception:
+            lines.append(f"  qiskit-aer: {self.qiskit_aer_version}")
+        try:
+            lines.append(f"  {format_version_status('qiskit-qasm3-import', self.qiskit_qasm3_import_version)}")
+        except Exception:
+            lines.append(f"  qiskit-qasm3-import: {self.qiskit_qasm3_import_version}")
+        lines.append("")
+        qiskit_smoke = "OPENQASM 3.0;\ninclude \"stdgates.inc\";\nqubit[1] q;\nbit[1] c;\nh q[0];\nc[0] = measure q[0];\n"
+        try:
+            t0 = time.perf_counter()
+            circuit = qiskit_parse(qiskit_smoke)
+            t_parse = (time.perf_counter() - t0) * 1000.0
+            backend = AerSimulator()
+            t1 = time.perf_counter()
+            compiled = transpile(circuit, backend)
+            t_transpile = (time.perf_counter() - t1) * 1000.0
+            t2 = time.perf_counter()
+            result = backend.run(compiled, shots=self.shots).result()
+            t_run = (time.perf_counter() - t2) * 1000.0
+            lines.append("Qiskit smoke tests:")
+            lines.append(f"  Aer backend: {backend.name}")
+            lines.append(f"  qasm3 parse smoke: ok ({t_parse:.1f} ms)")
+            lines.append(f"  transpile smoke: ok ({t_transpile:.1f} ms)")
+            lines.append(f"  run smoke (Hadamard gate, {self.shots} shots): ok ({t_run:.1f} ms)")
+            lines.append(f"  counts sample (Hadamard gate): {result.get_counts()}")
+        except Exception as exc:
+            lines.append(f"Qiskit smoke tests: failed ({exc})")
+        self.signals.finished.emit("\n".join(lines))
+
+
 def kind(node: Any) -> str:
     return type(node).__name__
 
@@ -224,6 +310,42 @@ def format_counts_readable(run_counts: Any) -> list[str]:
         pct = (100.0 * count / total_shots) if total_shots else 0.0
         lines.append(f"  {reading} -> {count} ({pct:.2f}%)")
     return lines
+
+
+def get_latest_package_version(package_name: str) -> str | None:
+    """Fetch the latest version of a package from PyPI.
+    
+    Args:
+        package_name: Name of the package on PyPI.
+        
+    Returns:
+        Latest version string, or None if unable to fetch.
+    """
+    try:
+        url = f"https://pypi.org/pypi/{package_name}/json"
+        with request.urlopen(url, timeout=3) as response:
+            data = json.loads(response.read().decode('utf-8'))
+            return data.get('info', {}).get('version')
+    except Exception:
+        return None
+
+
+def format_version_status(package_name: str, current_version: str) -> str:
+    """Format version status for a package (current vs latest).
+    
+    Args:
+        package_name: Name of the package.
+        current_version: Currently installed version.
+        
+    Returns:
+        Formatted string with version info and status indicator.
+    """
+    latest = get_latest_package_version(package_name)
+    if latest is None:
+        return f"{package_name}: {current_version}"
+    if latest == current_version:
+        return f"{package_name}: {current_version} (up-to-date)"
+    return f"{package_name}: {current_version} → {latest} (update available)"
 
 
 def subst_env(text: str, env: dict[str, Any]) -> str:
@@ -1830,13 +1952,17 @@ class RulesDialog(QDialog):
         self.setWindowTitle(title)
         self.resize(900, 600)
         layout = QVBoxLayout(self)
-        box = QTextEdit()
-        box.setReadOnly(True)
-        box.setPlainText(text)
-        layout.addWidget(box)
+        self.box = QTextEdit()
+        self.box.setReadOnly(True)
+        self.box.setPlainText(text)
+        layout.addWidget(self.box)
         close = QPushButton("Close")
         close.clicked.connect(self.accept)
         layout.addWidget(close)
+
+    def update_text(self, text: str) -> None:
+        """Update the dialog's text content."""
+        self.box.setPlainText(text)
 
 
 class SearchDialog(QDialog):
@@ -2601,43 +2727,48 @@ class MainWindow(QMainWindow):
             if exc.__class__.__name__ != "PackageNotFoundError":
                 antlr4_version = "unknown"
 
-        lines = [
-            f"Python: {sys.version.split()[0]}",
-            f"Python executable: {sys.executable}",
-            f"PySide6: {PySide6.__version__}",
-            f"openqasm3: {getattr(sys.modules.get('openqasm3'), '__version__', 'unknown')}",
-            f"antlr4-python3-runtime: {antlr4_version}",
-            "",
-            "Qiskit runtime:",
-            f"  qiskit: {getattr(sys.modules.get('qiskit'), '__version__', 'unknown')}",
-            f"  qiskit-aer: {getattr(sys.modules.get('qiskit_aer'), '__version__', 'unknown')}",
-            f"  qiskit-qasm3-import: {getattr(qiskit_qasm3_import, '__version__', 'unknown')}",
-        ]
+        # Collect version info
+        pyside6_version = PySide6.__version__
+        openqasm3_version = getattr(sys.modules.get('openqasm3'), '__version__', 'unknown')
+        qiskit_version = getattr(sys.modules.get('qiskit'), '__version__', 'unknown')
+        qiskit_aer_version = getattr(sys.modules.get('qiskit_aer'), '__version__', 'unknown')
+        qiskit_qasm3_import_version = getattr(qiskit_qasm3_import, '__version__', 'unknown')
+        matplotlib_version = getattr(sys.modules.get('matplotlib'), '__version__', 'unknown')
+        pylatexenc_version = getattr(sys.modules.get('pylatexenc'), '__version__', 'unknown')
 
-        qiskit_smoke = "OPENQASM 3.0;\ninclude \"stdgates.inc\";\nqubit[1] q;\nbit[1] c;\nh q[0];\nc[0] = measure q[0];\n"
-        try:
-            t0 = time.perf_counter()
-            circuit = qiskit_parse(qiskit_smoke)
-            t_parse = (time.perf_counter() - t0) * 1000.0
+        # Show initial dialog with placeholder
+        initial_text = (
+            f"Python: {sys.version.split()[0]}\n"
+            f"Python executable: {sys.executable}\n"
+            "\n"
+            "Library versions:\n"
+            f"  PySide6: {pyside6_version}\n"
+            f"  openqasm3: {openqasm3_version}\n"
+            f"  antlr4-python3-runtime: {antlr4_version}\n"
+            f"  matplotlib: {matplotlib_version}\n"
+            f"  pylatexenc: {pylatexenc_version}\n"
+            "\n"
+            "Qiskit runtime:\n"
+            f"  qiskit: {qiskit_version}\n"
+            f"  qiskit-aer: {qiskit_aer_version}\n"
+            f"  qiskit-qasm3-import: {qiskit_qasm3_import_version}\n"
+            "\n"
+            "⟳ Checking for updates..."
+        )
+        dialog = RulesDialog(initial_text, self, title="Diagnostics")
 
-            backend = AerSimulator()
-            t1 = time.perf_counter()
-            compiled = transpile(circuit, backend)
-            t_transpile = (time.perf_counter() - t1) * 1000.0
+        # Start background version check worker
+        worker = VersionCheckWorker(
+            pyside6_version, openqasm3_version, antlr4_version,
+            matplotlib_version, pylatexenc_version, qiskit_version,
+            qiskit_aer_version, qiskit_qasm3_import_version, self.shots
+        )
+        worker.signals.finished.connect(lambda text: dialog.update_text(text))
+        if not hasattr(self, '_thread_pool'):
+            self._thread_pool = QThreadPool()
+        self._thread_pool.start(worker)
 
-            t2 = time.perf_counter()
-            result = backend.run(compiled, shots=self.shots).result()
-            t_run = (time.perf_counter() - t2) * 1000.0
-
-            lines.append(f"  Aer backend: {backend.name}")
-            lines.append(f"  qasm3 parse smoke: ok ({t_parse:.1f} ms)")
-            lines.append(f"  transpile smoke: ok ({t_transpile:.1f} ms)")
-            lines.append(f"  run smoke (Hadamard gate, {self.shots} shots): ok ({t_run:.1f} ms)")
-            lines.append(f"  counts sample (Hadamard gate): {result.get_counts()}")
-        except Exception as exc:
-            lines.append(f"  runtime smoke: failed ({exc})")
-
-        RulesDialog("\n".join(lines), self, title="Diagnostics").exec()
+        dialog.exec()
 
     def show_rules(self) -> None:
         RulesDialog(self.load_rewrite_rules_text(), self).exec()
