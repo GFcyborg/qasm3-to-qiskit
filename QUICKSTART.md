@@ -86,7 +86,7 @@ python split.py examples/adder.qasm
 - `README.md` - Includes split.py documentation
 
 **Unchanged**
-- `setup.sh`, `requirements.txt`, `app.py`
+- `setup.sh`, `requirements.txt`, `run.py`
 - All examples in `examples/`
 - Grammar files in `grammar/`
 
