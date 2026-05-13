@@ -126,17 +126,30 @@ def eval_node(node: Any, env: dict[str, Any]) -> Any | None:
         base = eval_node(getattr(node, "collection", None), env)
         if base is None:
             return None
-        indices = getattr(node, "index", [])
+        # `index` can be a single node, a list, or an AST node like DiscreteSet
+        indices = getattr(node, "index", None)
+        if indices is None:
+            indices = getattr(node, "indices", [])
+
+        # Normalize to an iterable of index expressions
+        if dataclasses.is_dataclass(indices) and hasattr(indices, "values"):
+            indices_iter = getattr(indices, "values") or []
+        elif isinstance(indices, list):
+            indices_iter = indices
+        else:
+            indices_iter = [indices]
+
         if isinstance(base, int):
             value = base
-            for index in indices:
+            for index in indices_iter:
                 resolved = eval_node(index, env)
                 if resolved is None:
                     return None
                 value = (int(value) >> int(resolved)) & 1
             return value
+
         value = base
-        for index in indices:
+        for index in indices_iter:
             resolved = eval_node(index, env)
             if resolved is None:
                 return None
@@ -1048,8 +1061,16 @@ def transpile_qasm(source: str) -> tuple[str, list[Issue], Any | None]:
                 if name.startswith("$"):
                     return None
                 max_index = 0
-                for index_group in getattr(operand, "indices", []):
-                    for index_expr in index_group:
+                for index_group in getattr(operand, "indices", []) or []:
+                    # index_group may be a DiscreteSet dataclass with a `.values` list
+                    if dataclasses.is_dataclass(index_group) and hasattr(index_group, "values"):
+                        index_items = getattr(index_group, "values") or []
+                    elif isinstance(index_group, list):
+                        index_items = index_group
+                    else:
+                        index_items = [index_group]
+
+                    for index_expr in index_items:
                         value = eval_node(index_expr, {})
                         if value is None:
                             return None

@@ -44,6 +44,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QPlainTextEdit,
     QSplitter,
+    QTabWidget,
     QTextEdit,
     QTreeWidget,
     QTreeWidgetItem,
@@ -1152,6 +1153,7 @@ class MainWindow(QMainWindow):
         if default.exists():
             self.load_path(default)
 
+
     def show_search_dialog(self) -> None:
         if self._search_dialog is None:
             self._search_dialog = SearchDialog(self)
@@ -1785,16 +1787,55 @@ class MainWindow(QMainWindow):
             self._syncing = False
 
 
+class ChunkTabsWindow(QMainWindow):
+    """Host one full `MainWindow` instance per chunk in top-level tabs."""
+
+    def __init__(self, chunk_files: list[Path]) -> None:
+        super().__init__()
+        self.base_title = "QASM3 Aer Lab - Chunk Runs"
+        self.setWindowTitle(self.base_title)
+        self._tabs = QTabWidget()
+        self.setCentralWidget(self._tabs)
+
+        for chunk_file in chunk_files:
+            child = MainWindow(file_to_load=str(chunk_file))
+            child.setParent(self)
+            self._tabs.addTab(child, chunk_file.name)
+
+        self._tabs.currentChanged.connect(self._refresh_title)
+        self._refresh_title(self._tabs.currentIndex())
+
+    def _refresh_title(self, index: int) -> None:
+        if 0 <= index < self._tabs.count():
+            self.setWindowTitle(f"{self.base_title} - {self._tabs.tabText(index)}")
+        else:
+            self.setWindowTitle(self.base_title)
+
+
 def main() -> int:
     import argparse
     parser = argparse.ArgumentParser(description="QASM3 Aer Lab - Test OpenQASM 3 with Qiskit")
-    parser.add_argument("file", nargs="?", default=None, help="QASM file to load on startup")
+    parser.add_argument("file", nargs="?", default=None, help="QASM file or directory to load on startup")
     args = parser.parse_args()
     
     app = QApplication(sys.argv)
     app.setApplicationName("QASM3 Aer Lab")
     app.setOrganizationName("Copilot")
-    window = MainWindow(file_to_load=args.file)
+
+    window: QMainWindow
+    if args.file:
+        path = Path(args.file)
+        if path.exists() and path.is_dir():
+            chunk_files = sorted(path.glob("*.qasm"))
+            if chunk_files:
+                window = ChunkTabsWindow(chunk_files)
+            else:
+                window = MainWindow(file_to_load=None)
+        else:
+            window = MainWindow(file_to_load=args.file)
+    else:
+        window = MainWindow(file_to_load=None)
+
     screen = app.primaryScreen()
     if screen is not None:
         geo = screen.availableGeometry()

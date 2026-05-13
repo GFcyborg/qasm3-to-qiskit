@@ -34,7 +34,6 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QInputDialog,
     QLineEdit,
-    QMenu,
     QToolBar,
 )
 
@@ -106,21 +105,30 @@ class CodeEditor(QPlainTextEdit):
         self.customContextMenuRequested.connect(self.show_context_menu)
 
     def show_context_menu(self, pos: Any) -> None:
-        """Show right-click menu to add/remove split points."""
+        """Toggle split marker on right-clicked line without showing a menu."""
         cursor = self.cursorForPosition(pos)
         line = cursor.blockNumber() + 1  # Convert to 1-indexed
-        
-        menu = QMenu(self)
+
         if line in self.split_points:
-            remove_action = QAction(f"Remove split at line {line}", self)
-            remove_action.triggered.connect(lambda: self.remove_split_point(line))
-            menu.addAction(remove_action)
+            self.remove_split_point(line)
         else:
-            add_action = QAction(f"Add split after line {line}", self)
-            add_action.triggered.connect(lambda: self.add_split_point(line))
-            menu.addAction(add_action)
-        
-        menu.exec(self.mapToGlobal(pos))
+            # Verify that a split at this line is allowed (top-level only)
+            window = self.window()
+            try:
+                allowed = True if not hasattr(window, "is_line_splittable") else window.is_line_splittable(line)
+            except Exception:
+                allowed = True
+            if not allowed:
+                # flash a short status message to inform the user
+                try:
+                    if hasattr(window, "flash_status"):
+                        window.flash_status("Cannot split inside gate/loop body (unsupported)")
+                    else:
+                        self.parent().status_label.setText("Cannot split inside gate/loop body (unsupported)")
+                except Exception:
+                    pass
+                return
+            self.add_split_point(line)
 
     def add_split_point(self, line: int) -> None:
         """Mark a split point at line (1-indexed, means split AFTER this line)."""
@@ -206,7 +214,7 @@ class SplitWindow(QMainWindow):
         
         # Left pane: original code with split markers
         self.editor = CodeEditor()
-        editor_panel, _ = self.make_titled_panel("Original QASM (right-click to split)", "#d8ecff", self.editor)
+        editor_panel, _ = self.make_titled_panel("Original QASM (right-click to toggle split)", "#d8ecff", self.editor)
         
         # Right pane: tabbed chunks
         self.chunk_tabs = QTabWidget()
@@ -433,6 +441,50 @@ class SplitWindow(QMainWindow):
         
         return chunks
 
+    def is_line_splittable(self, line: int) -> bool:
+        """Return True if the given 1-indexed line is a top-level location where splitting is allowed.
+
+        Splitting inside gate bodies, loops, subroutines, boxes, and similar inner scopes
+        is not allowed. If the program failed to parse, allow splitting (we can't determine).
+        """
+        if self.current_program is None:
+            return True
+
+        # Kinds whose spans define inner scopes we should not split inside
+        blocking_kinds = {
+            "QuantumGateDefinition",
+            "ForInLoop",
+            "BranchingStatement",
+            "Box",
+            "SubroutineDefinition",
+            "CalibrationDefinition",
+            "CalibrationGrammarDeclaration",
+        }
+
+        for node in node_iter(self.current_program):
+            if kind(node) not in blocking_kinds:
+                continue
+            s = span(node)
+            if not s:
+                continue
+            start = int(getattr(s, "start_line", 0))
+            end = int(getattr(s, "end_line", 0))
+            # If the selected line is strictly inside the node span (not at its closing line), block it
+            if start <= line < end:
+                return False
+        return True
+
+    def flash_status(self, message: str, timeout_ms: int = 1800) -> None:
+        """Temporarily show `message` in the status label, then restore previous text."""
+        prev = self.status_label.text()
+        self.status_label.setText(message)
+        # Use red text for visibility
+        self.status_label.setStyleSheet("color: #cc0000; font-weight: 700;")
+        def _restore() -> None:
+            self.status_label.setText(prev)
+            self.status_label.setStyleSheet("")
+        QTimer.singleShot(timeout_ms, _restore)
+
     def preview_chunks(self) -> list[tuple[str, str, str]]:
         """Generate and preview chunks. Returns list of (name, original, rewritten)."""
         if not self.editor.toPlainText():
@@ -532,19 +584,18 @@ class SplitWindow(QMainWindow):
             QMessageBox.warning(self, "No chunk files", f"No chunks found in {chunks_dir}")
             return
         
-        for chunk_file in chunk_files:
-            try:
-                # Launch run.py with this chunk
-                script = ROOT / "run.py"
-                subprocess.Popen(
-                    [sys.executable, str(script), str(chunk_file)],
-                    cwd=str(ROOT),
-                )
-            except Exception as exc:
-                QMessageBox.critical(self, "Launch failed", f"Failed to launch run.py: {exc}")
-                return
-        
-        self.status_label.setText(f"Launched {len(chunk_files)} run.py instances")
+        try:
+            # Launch a single run.py and pass the chunks directory so it opens tabs
+            script = ROOT / "run.py"
+            subprocess.Popen(
+                [sys.executable, str(script), str(chunks_dir)],
+                cwd=str(ROOT),
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Launch failed", f"Failed to launch run.py: {exc}")
+            return
+
+        self.status_label.setText(f"Launched run.py for chunks in {chunks_dir.name}")
 
 
 def main() -> int:

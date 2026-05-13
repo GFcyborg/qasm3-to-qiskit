@@ -23,8 +23,3 @@ gate my_gate(a) c, t {
   cx c, t;
 }
 
-// Gate modifiers work as well; this gate is equivalent to `p(-a) c;`.
-gate my_phase(a) c {
-  ctrl @ inv @ gphase(a) c;
-}
-

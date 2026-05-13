@@ -30,13 +30,18 @@ gate swap a, b { cx a, b; cx b, a; cx a, b; }
 gate ccx a, b, c { ctrl @ ctrl @ x a, b, c; }
 gate cswap a, b, c { ctrl @ swap a, b, c; }
 gate cu(theta, phi, lambda, gamma) a, b { p(gamma - theta / 2) a; ctrl @ U(theta, phi, lambda) a, b; }
-gate majority a, b, c {
-  cx c, b;
-  cx c, a;
-  ccx a, b, c;
+qubit[4] q;
+bit[4] c;
+reset q;
+h q;
+barrier q;
+h q[0];
+c[0] = measure q[0];
+if (c == 1) {
+  rz(pi / 2) q[1];
 }
-gate unmaj a, b, c {
-  ccx a, b, c;
-  cx c, a;
-  cx a, b;
+h q[1];
+c[1] = measure q[1];
+if (c == 1) {
+  rz(pi / 4) q[2];
 }

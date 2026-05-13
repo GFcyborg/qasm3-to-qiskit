@@ -1,0 +1,8 @@
+{
+  "original_file": "/home/gf/Documents/SPDM801_thesis/qasm3-to-qiskit/examples/inverseqft2.qasm",
+  "chunk_count": 2,
+  "chunk_files": [
+    "/home/gf/Documents/SPDM801_thesis/qasm3-to-qiskit/chunks/inverseqft2/inverseqft2_1.qasm",
+    "/home/gf/Documents/SPDM801_thesis/qasm3-to-qiskit/chunks/inverseqft2/inverseqft2_2.qasm"
+  ]
+}
