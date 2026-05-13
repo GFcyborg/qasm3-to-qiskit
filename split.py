@@ -14,7 +14,7 @@ import json
 import shutil
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import PySide6
 from PySide6.QtCore import Qt, QTimer, QSize, QRect, QEvent
@@ -113,7 +113,7 @@ class CodeEditor(QPlainTextEdit):
             self.remove_split_point(line)
         else:
             # Verify that a split at this line is allowed (top-level only)
-            window = self.window()
+            window = cast("SplitWindow", self.window())
             try:
                 allowed = True if not hasattr(window, "is_line_splittable") else window.is_line_splittable(line)
             except Exception:
@@ -124,7 +124,10 @@ class CodeEditor(QPlainTextEdit):
                     if hasattr(window, "flash_status"):
                         window.flash_status("Cannot split inside gate/loop body (unsupported)")
                     else:
-                        self.parent().status_label.setText("Cannot split inside gate/loop body (unsupported)")
+                        # Fallback: set parent status if available
+                        parent = getattr(self, "parent", lambda: None)()
+                        if parent and hasattr(parent, "status_label"):
+                            parent.status_label.setText("Cannot split inside gate/loop body (unsupported)")
                 except Exception:
                     pass
                 return
