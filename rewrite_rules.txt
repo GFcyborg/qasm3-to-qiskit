@@ -67,6 +67,8 @@ OTHERS
 - Rewrite gate definitions by rewriting/unrolling their bodies when needed.
   This primarily targets static `for` loops inside `gate` bodies.
   Example: vqe.qasm:25.
+- Rename colliding user-defined gates to `my_<name>` so the stdgates compatibility block can be injected untouched.
+  Example: `cphase` -> `my_cphase` in `cphase_3.1+.qasm`.
 
 **DROPPING**
 - Drop includes other than stdgates.inc.

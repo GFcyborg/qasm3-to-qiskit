@@ -87,6 +87,7 @@ REWRITE_RULES_SYNC_MARKERS = (
     "Unbox box statements by emitting only their inner body statements.",
     "Drop subroutines, aliasing, and classical assignments not supported by qiskit importer.",
     "Rewrite gate definitions by rewriting/unrolling their bodies when needed.",
+    "Rename colliding user-defined gates to my_<name> so stdgates definitions remain untouched.",
     "Keep reset, measurement, gate definitions, and quantum gate operations.",
     "Substitute compile-time environment values into emitted statements.",
     "Normalize uint tokens to int in rewritten output.",
@@ -415,6 +416,18 @@ def mark_includes(program: Any, editor: QPlainTextEdit) -> list[tuple[int, int, 
             walk(child)
 
     walk(program)
+    return spans
+
+
+def mark_rewrite_issues(issues: list[Issue], editor: QPlainTextEdit) -> list[tuple[int, int, str]]:
+    spans: list[tuple[int, int, str]] = []
+    for issue in issues:
+        if issue.start <= 0 or issue.end <= 0:
+            continue
+        start = to_pos(editor, issue.start - 1, 0)
+        end = clamp_cursor_pos(editor, to_pos(editor, issue.end - 1, 999999))
+        if end >= start:
+            spans.append((start, end, issue.detail))
     return spans
 
 
@@ -1229,7 +1242,9 @@ class MainWindow(QMainWindow):
         if program is not None:
             self.tree.addTopLevelItem(make_tree(program))
             self.tree.expandToDepth(2)
-        self.editor.set_issue_spans(mark_unsupported(program, self.editor) if program else [])
+        issue_spans = mark_unsupported(program, self.editor) if program else []
+        issue_spans.extend(mark_rewrite_issues(issues, self.editor))
+        self.editor.set_issue_spans(issue_spans)
         self.editor.set_include_spans(mark_includes(program, self.editor) if program else [])
         if circuit is not None:
             self.show_circuit(circuit)

@@ -306,6 +306,13 @@ def substitute_names(text: str, mapping: dict[str, str]) -> str:
     return out
 
 
+def renamed_gate_name(name: str, taken_names: set[str]) -> str:
+    candidate = f"my_{name}"
+    while candidate in taken_names or candidate == name:
+        candidate += "_"
+    return candidate
+
+
 def subroutine_is_inlineable(subroutine: Any) -> bool:
     def stmt_inlineable(stmt: Any) -> bool:
         k = kind(stmt)
@@ -444,6 +451,7 @@ def inline_call_assignment_if_pattern(
     indent: int,
     subroutines: dict[str, Any],
     inline_depth: int,
+    gate_renames: dict[str, str] | None = None,
 ) -> list[str] | None:
     if kind(assign_stmt) != "ClassicalAssignment" or kind(next_stmt) != "BranchingStatement":
         return None
@@ -490,7 +498,7 @@ def inline_call_assignment_if_pattern(
     for lhs_text, rhs_text in pairs:
         out.append(pad + f"if ({lhs_text} == true) {{")
         out.append(pad + f"  if ({rhs_text} == true) {{")
-        out.extend(emit_stmt(gate_stmt, env, issues, indent + 2, subroutines=subroutines, inline_depth=inline_depth))
+        out.extend(emit_stmt(gate_stmt, env, issues, indent + 2, subroutines=subroutines, inline_depth=inline_depth, gate_renames=gate_renames))
         out.append(pad + "  }")
         out.append(pad + "}")
     return out
@@ -505,6 +513,7 @@ def inline_subroutine_call(
     indent: int,
     subroutines: dict[str, Any],
     inline_depth: int,
+    gate_renames: dict[str, str] | None = None,
 ) -> list[str] | None:
     MAX_INLINE_DEPTH = 6
     if inline_depth >= MAX_INLINE_DEPTH:
@@ -566,6 +575,7 @@ def inline_subroutine_call(
             indent,
             subroutines=subroutines,
             inline_depth=inline_depth + 1,
+            gate_renames=gate_renames,
         )
         out.extend(substitute_names(line, name_map) for line in inner_lines)
     return out
@@ -579,6 +589,7 @@ def emit_stmt(
     *,
     subroutines: dict[str, Any] | None = None,
     inline_depth: int = 0,
+    gate_renames: dict[str, str] | None = None,
 ) -> list[str]:
     if subroutines is None:
         subroutines = {}
@@ -674,6 +685,7 @@ def emit_stmt(
                         indent,
                         subroutines,
                         inline_depth,
+                        gate_renames,
                     )
                     if inlined is not None:
                         return inlined
@@ -700,7 +712,7 @@ def emit_stmt(
             next_env = dict(env)
             next_env[ident] = value
             for inner in getattr(stmt, "block", []):
-                out.extend(emit_stmt(inner, next_env, issues, indent, subroutines=subroutines, inline_depth=inline_depth))
+                out.extend(emit_stmt(inner, next_env, issues, indent, subroutines=subroutines, inline_depth=inline_depth, gate_renames=gate_renames))
         return out
     if k == "BranchingStatement":
         cond_value = eval_node(getattr(stmt, "condition", None), env)
@@ -708,7 +720,7 @@ def emit_stmt(
             block = getattr(stmt, "if_block" if cond_value else "else_block", [])
             out: list[str] = []
             for inner in block:
-                out.extend(emit_stmt(inner, env, issues, indent, subroutines=subroutines, inline_depth=inline_depth))
+                out.extend(emit_stmt(inner, env, issues, indent, subroutines=subroutines, inline_depth=inline_depth, gate_renames=gate_renames))
             return out
         cond_text = rewrite_condition_text(getattr(stmt, "condition", None), env)
         if cond_text is None:
@@ -717,17 +729,17 @@ def emit_stmt(
         cond_text = subst_env(cond_text, env)
         out = [pad + f"if ({cond_text}) {{"]
         for inner in getattr(stmt, "if_block", []):
-            out.extend(emit_stmt(inner, env, issues, indent + 1, subroutines=subroutines, inline_depth=inline_depth))
+            out.extend(emit_stmt(inner, env, issues, indent + 1, subroutines=subroutines, inline_depth=inline_depth, gate_renames=gate_renames))
         if getattr(stmt, "else_block", []):
             out.append(pad + "} else {")
             for inner in getattr(stmt, "else_block", []):
-                out.extend(emit_stmt(inner, env, issues, indent + 1, subroutines=subroutines, inline_depth=inline_depth))
+                out.extend(emit_stmt(inner, env, issues, indent + 1, subroutines=subroutines, inline_depth=inline_depth, gate_renames=gate_renames))
         out.append(pad + "}")
         return out
     if k == "Box":
         out: list[str] = []
         for inner in getattr(stmt, "body", []):
-            out.extend(emit_stmt(inner, env, issues, indent, subroutines=subroutines, inline_depth=inline_depth))
+            out.extend(emit_stmt(inner, env, issues, indent, subroutines=subroutines, inline_depth=inline_depth, gate_renames=gate_renames))
         return out
     if k == "ExpressionStatement":
         expr = getattr(stmt, "expression", None)
@@ -743,6 +755,7 @@ def emit_stmt(
                     indent,
                     subroutines,
                     inline_depth,
+                    gate_renames,
                 )
                 if inlined is not None:
                     return inlined
@@ -780,9 +793,15 @@ def emit_stmt(
         text = subst_env(dumps(stmt).strip(), env)
         if re.match(r"^u\b", text):
             text = re.sub(r"^u\b", "U(0, 0, 0)", text)
+        if gate_renames:
+            text = substitute_names(text, gate_renames)
         return [pad + text]
     if k == "QuantumGateDefinition":
         name = getattr(getattr(stmt, "name", None), "name", "")
+        rename_to = gate_renames.get(name) if gate_renames else None
+        if rename_to:
+            append_issue(issues, stmt, "quantumgatedefinition", f"rename colliding gate {name} -> {rename_to} to avoid stdgates.inc collision")
+            name = rename_to
         params: list[str] = []
         for arg in getattr(stmt, "arguments", []) or []:
             if kind(arg) == "Identifier":
@@ -798,7 +817,10 @@ def emit_stmt(
                 qubits.append(qb_name)
 
         if not name or not qubits:
-            return [pad + dumps(stmt).strip()]
+            text = dumps(stmt).strip()
+            if gate_renames:
+                text = substitute_names(text, gate_renames)
+            return [pad + text]
 
         header = f"gate {name}"
         if params:
@@ -807,7 +829,7 @@ def emit_stmt(
 
         out: list[str] = [pad + header]
         for inner in getattr(stmt, "body", []) or []:
-            out.extend(emit_stmt(inner, env, issues, indent + 1, subroutines=subroutines, inline_depth=inline_depth))
+            out.extend(emit_stmt(inner, env, issues, indent + 1, subroutines=subroutines, inline_depth=inline_depth, gate_renames=gate_renames))
         out.append(pad + "}")
         return out
     if k == "SubroutineDefinition":
@@ -828,18 +850,22 @@ def emit_stmt(
                     indent,
                     subroutines,
                     inline_depth,
+                    gate_renames,
                 )
                 if lowered is not None:
                     out.extend(lowered)
                     i += 2
                     continue
-            out.extend(emit_stmt(current, env, issues, indent, subroutines=subroutines, inline_depth=inline_depth))
+            out.extend(emit_stmt(current, env, issues, indent, subroutines=subroutines, inline_depth=inline_depth, gate_renames=gate_renames))
             i += 1
         return out
     if k == "Annotation":
         return []
     try:
-        return [pad + subst_env(dumps(stmt).strip(), env)]
+        text = subst_env(dumps(stmt).strip(), env)
+        if gate_renames:
+            text = substitute_names(text, gate_renames)
+        return [pad + text]
     except Exception:
         append_issue(issues, stmt, k.lower(), "cannot emit statement")
         return []
@@ -928,12 +954,44 @@ def transpile_qasm(source: str) -> tuple[str, list[Issue], Any | None]:
     issues: list[Issue] = []
     lines: list[str] = []
     subroutines: dict[str, Any] = {}
-    
+
     for stmt in getattr(program, "statements", []):
         if kind(stmt) == "SubroutineDefinition":
             name = getattr(getattr(stmt, "name", None), "name", "")
             if name:
                 subroutines[name] = stmt
+
+    stdgates_defs = stdgates_compat_lines()
+    stdgates_names: list[str] = []
+    import re as _re
+    for defline in stdgates_defs:
+        m = _re.match(r"^gate\s+([A-Za-z_]\w*)", defline)
+        if m:
+            stdgates_names.append(m.group(1))
+
+    user_defined: set[str] = set()
+    try:
+        for stmt in getattr(program, "statements", []):
+            if kind(stmt) == "QuantumGateDefinition":
+                name_obj = getattr(stmt, "name", None) or getattr(stmt, "identifier", None)
+                name = getattr(name_obj, "name", None)
+                if name:
+                    user_defined.add(name)
+            for node in node_iter(stmt):
+                if kind(node) == "QuantumGateDefinition":
+                    name = getattr(getattr(node, "identifier", None), "name", None)
+                    if name:
+                        user_defined.add(name)
+    except Exception:
+        pass
+
+    gate_renames: dict[str, str] = {}
+    taken_gate_names = set(user_defined) | set(stdgates_names)
+    for name in sorted(user_defined):
+        if name in stdgates_names:
+            renamed = renamed_gate_name(name, taken_gate_names)
+            gate_renames[name] = renamed
+            taken_gate_names.add(renamed)
 
     lines.append("OPENQASM 3.0;")
     stmts = list(program.statements)
@@ -959,13 +1017,14 @@ def transpile_qasm(source: str) -> tuple[str, list[Issue], Any | None]:
                 0,
                 subroutines,
                 0,
+                gate_renames,
             )
             if lowered is not None:
                 lines.extend(lowered)
                 i += 2
                 continue
 
-        lines.extend(emit_stmt(stmt, env, issues, 0, subroutines=subroutines, inline_depth=0))
+        lines.extend(emit_stmt(stmt, env, issues, 0, subroutines=subroutines, inline_depth=0, gate_renames=gate_renames))
         i += 1
 
     def inferred_qubit_decl_lines() -> list[str]:
@@ -1040,34 +1099,31 @@ def transpile_qasm(source: str) -> tuple[str, list[Issue], Any | None]:
     except Exception:
         pass
 
+    gate_renames: dict[str, str] = {}
+    taken_gate_names = set(user_defined) | set(stdgates_names)
+    for name in sorted(user_defined):
+        if name in stdgates_names:
+            renamed = renamed_gate_name(name, taken_gate_names)
+            gate_renames[name] = renamed
+            taken_gate_names.add(renamed)
+
     joined = "\n".join(line for line in lines if line.strip())
     if stdgates_names:
         pattern = _re.compile(r"\b(" + "|".join(_re.escape(n) for n in stdgates_names) + r")\b")
         has_std_ref = bool(pattern.search(joined))
         has_defs = any(defline.strip() in (ln.strip() for ln in lines) for defline in stdgates_defs)
         if has_std_ref and not has_defs:
-            filtered_defs = []
-            filtered_names = []
-            for defline in stdgates_defs:
-                m = _re.match(r"^gate\s+([A-Za-z_]\w*)", defline)
-                if m:
-                    nm = m.group(1)
-                    if nm in user_defined:
-                        continue
-                    filtered_defs.append(defline)
-                    filtered_names.append(nm)
-
             original_lines = [ln for ln in lines if ln.strip()]
             if original_lines and original_lines[0].strip().upper().startswith("OPENQASM"):
-                out_lines = [original_lines[0]] + filtered_defs + original_lines[1:]
-                start_idx = 1 + len(filtered_defs)
+                out_lines = [original_lines[0]] + stdgates_defs + original_lines[1:]
+                start_idx = 1 + len(stdgates_defs)
             else:
-                out_lines = filtered_defs + original_lines
-                start_idx = len(filtered_defs)
+                out_lines = stdgates_defs + original_lines
+                start_idx = len(stdgates_defs)
 
             for i in range(start_idx, len(out_lines)):
                 line = out_lines[i]
-                for name in (filtered_names if 'filtered_names' in locals() else stdgates_names):
+                for name in stdgates_names:
                     up = name.upper()
                     if up == name:
                         continue
