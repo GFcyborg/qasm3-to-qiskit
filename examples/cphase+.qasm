@@ -1,9 +1,9 @@
 gate cphase(θ) a, b
 {
   U(0, 0, θ / 2) a;
-  CX a, b;
+  cx a, b;
   U(0, 0, -θ / 2) b;
-  CX a, b;
+  cx a, b;
   U(0, 0, θ / 2) b;
 }
 
