@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import concurrent.futures
+from html import escape
 import json
 import multiprocessing
 import math
@@ -821,12 +822,43 @@ class RulesDialog(QDialog):
         layout = QVBoxLayout(self)
         self.box = QTextEdit()
         self.box.setReadOnly(True)
-        self.box.setPlainText(text)
+        self.box.setHtml(self._format_text(text))
         layout.addWidget(self.box)
 
     def update_text(self, text: str) -> None:
         """Update the dialog's text content."""
-        self.box.setPlainText(text)
+        self.box.setHtml(self._format_text(text))
+
+    def _format_text(self, text: str) -> str:
+        def is_section_heading(line: str) -> bool:
+            stripped = line.strip()
+            if not stripped:
+                return False
+            if stripped.startswith("-"):
+                return False
+            if stripped.endswith(":"):
+                return True
+            if stripped.isupper() and any(ch.isalpha() for ch in stripped):
+                return True
+            return stripped in {
+                "INSERTIONS",
+                "FOLDING / UNROLLING / UNBOXING",
+                "DATA-TYPE CASTINGS",
+                "OTHERS",
+                "DROPPING",
+            }
+
+        html_lines: list[str] = [
+            '<div style="font-family: monospace; white-space: pre-wrap; line-height: 1.35;">'
+        ]
+        for line in text.splitlines():
+            safe = escape(line)
+            if is_section_heading(line):
+                html_lines.append(f"<div><strong>{safe}</strong></div>")
+            else:
+                html_lines.append(f"<div>{safe}</div>")
+        html_lines.append("</div>")
+        return "\n".join(html_lines)
 
 
 class SearchDialog(QDialog):
