@@ -18,7 +18,7 @@ from typing import Any
 
 import PySide6
 from PySide6.QtCore import Qt, QTimer, QSize, QRect, QEvent
-from PySide6.QtGui import QColor, QFont, QPainter, QAction, QKeySequence, QCursor, QTextCursor
+from PySide6.QtGui import QColor, QFont, QPainter, QAction, QKeySequence, QCursor, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -39,11 +39,14 @@ from PySide6.QtWidgets import (
 )
 
 from openqasm3 import parse
-from qasm_rewriter import transpile_qasm, kind, span, node_iter
+from qasm_rewriter import transpile_qasm, kind, span, node_iter, stdgates_compat_lines
 
 
 ROOT = Path(__file__).resolve().parent
 EXAMPLES = ROOT / "examples"
+
+
+STDGATES_LINE_SET = {line.strip() for line in stdgates_compat_lines()}
 
 
 def clear_directory_contents(path: Path) -> None:
@@ -60,6 +63,26 @@ def clear_directory_contents(path: Path) -> None:
             shutil.rmtree(child)
         else:
             child.unlink()
+
+
+def apply_gray_include_format(widget: QPlainTextEdit, text: str) -> None:
+    """Populate a plain-text widget and gray out stdgates include lines."""
+    widget.setPlainText(text)
+
+    include_format = QTextCharFormat()
+    include_format.setForeground(QColor("#303030"))
+    include_format.setBackground(QColor("#e0e0e0"))
+
+    document = widget.document()
+    for block_number in range(document.blockCount()):
+        block = document.findBlockByNumber(block_number)
+        if not block.isValid():
+            continue
+        if block.text().strip() not in STDGATES_LINE_SET:
+            continue
+        cursor = QTextCursor(block)
+        cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock, QTextCursor.MoveMode.KeepAnchor)
+        cursor.setCharFormat(include_format)
 
 
 @dataclass(slots=True)
@@ -371,7 +394,7 @@ class SplitWindow(QMainWindow):
                 tab.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
                 tab.setFont(QFont("DejaVu Sans Mono", self.font_size))
                 content = chunk_file.read_text()
-                tab.setPlainText(content)
+                apply_gray_include_format(tab, content)
                 self.chunk_tabs.addTab(tab, chunk_file.stem)
             
             self.split_button.setEnabled(False)  # Can't split chunks directory
@@ -439,7 +462,7 @@ class SplitWindow(QMainWindow):
             tab.setReadOnly(True)
             tab.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
             tab.setFont(QFont("DejaVu Sans Mono", self.font_size))
-            tab.setPlainText(rewritten)
+            apply_gray_include_format(tab, rewritten)
             self.chunk_tabs.addTab(tab, name)
 
     def save_chunks(self) -> None:
