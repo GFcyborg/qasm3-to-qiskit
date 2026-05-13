@@ -11,6 +11,7 @@ import sys
 import subprocess
 import tempfile
 import json
+import shutil
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Any
@@ -43,6 +44,22 @@ from qasm_rewriter import transpile_qasm, kind, span, node_iter
 
 ROOT = Path(__file__).resolve().parent
 EXAMPLES = ROOT / "examples"
+
+
+def clear_directory_contents(path: Path) -> None:
+    """Remove all existing contents from a directory without deleting it."""
+    if not path.exists():
+        path.mkdir(parents=True, exist_ok=True)
+        return
+    if path.is_file() or path.is_symlink():
+        path.unlink()
+        path.mkdir(parents=True, exist_ok=True)
+        return
+    for child in path.iterdir():
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
 
 
 @dataclass(slots=True)
@@ -441,7 +458,7 @@ class SplitWindow(QMainWindow):
         chunks_parent = ROOT / "chunks"
         chunks_parent.mkdir(exist_ok=True)
         out_dir = chunks_parent / base_name
-        out_dir.mkdir(exist_ok=True)
+        clear_directory_contents(out_dir)
         
         # Save chunks
         chunk_files: list[Path] = []
