@@ -816,6 +816,7 @@ class RulesDialog(QDialog):
     def __init__(self, text: str, parent: QWidget | None = None, title: str = "Rewrite rules") -> None:
         super().__init__(parent)
         self.setWindowTitle(title)
+        self.setWindowState(self.windowState() | Qt.WindowState.WindowMaximized)
         self.resize(900, 600)
         layout = QVBoxLayout(self)
         self.box = QTextEdit()
@@ -1637,7 +1638,9 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def show_rules(self) -> None:
-        RulesDialog(self.load_rewrite_rules_text(), self).exec()
+        dialog = RulesDialog(self.load_rewrite_rules_text(), self)
+        dialog.showMaximized()
+        dialog.exec()
 
     def load_rewrite_rules_text(self) -> str:
         if not REWRITE_RULES_FILE.exists():
