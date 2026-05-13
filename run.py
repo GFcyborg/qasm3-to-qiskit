@@ -823,9 +823,6 @@ class RulesDialog(QDialog):
         self.box.setReadOnly(True)
         self.box.setPlainText(text)
         layout.addWidget(self.box)
-        close = QPushButton("Close")
-        close.clicked.connect(self.accept)
-        layout.addWidget(close)
 
     def update_text(self, text: str) -> None:
         """Update the dialog's text content."""
