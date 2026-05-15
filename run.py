@@ -62,6 +62,7 @@ from qasm_rewriter import (
     majority_vote_pairs_from_subroutine, node_iter, range_values,
     stdgates_compat_lines, subroutine_is_inlineable, subroutine_param_names, kind,
 )
+from dqc_container import parse_dqc_text
 from qiskit import transpile
 from qiskit_aer import AerSimulator
 from qiskit_qasm3_import import parse as qiskit_parse
@@ -938,7 +939,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(content)
         return panel, title_bar
 
-    def __init__(self, file_to_load: str | None = None) -> None:
+    def __init__(self, file_to_load: str | None = None, load_default: bool = True) -> None:
         """Initialize the main window.
         
         Args:
@@ -1032,16 +1033,18 @@ class MainWindow(QMainWindow):
                     self.load_path(path)
                 else:
                     print(f"Warning: File not found: {file_to_load}", file=sys.stderr)
-                    self.load_default()
+                    if load_default:
+                        self.load_default()
             except Exception as e:
                 print(f"Error loading file {file_to_load}: {e}", file=sys.stderr)
-                self.load_default()
-        else:
+                if load_default:
+                    self.load_default()
+        elif load_default:
             self.load_default()
 
     def build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("File")
-        open_action = QAction("Open...", self)
+        open_action = QAction("Open QASM/DQC...", self)
         open_action.triggered.connect(self.open_file)
         file_menu.addAction(open_action)
         examples_menu = file_menu.addMenu("Examples")
@@ -1198,23 +1201,27 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"'{query}' not found", 3000)
 
     def open_file(self) -> None:
-        name, _ = QFileDialog.getOpenFileName(self, "Open QASM", str(EXAMPLES), "QASM files (*.qasm *.inc);;All files (*)")
+        name, _ = QFileDialog.getOpenFileName(self, "Open QASM/DQC", str(EXAMPLES), "QASM/DQC files (*.qasm *.inc *.dqc);;All files (*)")
         if name:
             self.load_path(Path(name))
 
-    def load_path(self, path: Path) -> None:
+    def load_source(self, source_text: str, title: str | None = None) -> None:
         self._syncing = True
         try:
-            self.editor.setPlainText(path.read_text())
-            # Clear any previously-marked spans immediately to avoid stale
-            # include/issue highlights showing before the view is refreshed.
+            self.editor.setPlainText(source_text)
             self.editor.set_issue_spans([])
             self.editor.set_include_spans([])
-            self.setWindowTitle(f"{self.base_title} - {path.resolve()}")
-            self.statusBar().showMessage(f"Loaded {path}")
+            if title is None:
+                self.setWindowTitle(self.base_title)
+            else:
+                self.setWindowTitle(f"{self.base_title} - {title}")
+            self.statusBar().showMessage("Loaded source")
         finally:
             self._syncing = False
         self.refresh_views()
+
+    def load_path(self, path: Path) -> None:
+        self.load_source(path.read_text(), str(path.resolve()))
 
     def debounced_refresh(self) -> None:
         if not self._syncing:
@@ -1790,17 +1797,25 @@ class MainWindow(QMainWindow):
 class ChunkTabsWindow(QMainWindow):
     """Host one full `MainWindow` instance per chunk in top-level tabs."""
 
-    def __init__(self, chunk_files: list[Path]) -> None:
+    def __init__(self, chunk_texts: list[tuple[str, str]], title: str) -> None:
         super().__init__()
-        self.base_title = "QASM3 Aer Lab - Chunk Runs"
+        self.base_title = title
         self.setWindowTitle(self.base_title)
         self._tabs = QTabWidget()
         self.setCentralWidget(self._tabs)
 
-        for chunk_file in chunk_files:
-            child = MainWindow(file_to_load=str(chunk_file))
+        for chunk_title, chunk_text in chunk_texts:
+            child = MainWindow(file_to_load=None, load_default=False)
             child.setParent(self)
-            self._tabs.addTab(child, chunk_file.name)
+            # Set editor content directly to avoid accidental reloading of the full DQC
+            child._syncing = True
+            try:
+                child.editor.setPlainText(chunk_text)
+                child.setWindowTitle(f"{self.base_title} - {chunk_title}")
+            finally:
+                child._syncing = False
+            child.refresh_views()
+            self._tabs.addTab(child, chunk_title)
 
         self._tabs.currentChanged.connect(self._refresh_title)
         self._refresh_title(self._tabs.currentIndex())
@@ -1825,12 +1840,10 @@ def main() -> int:
     window: QMainWindow
     if args.file:
         path = Path(args.file)
-        if path.exists() and path.is_dir():
-            chunk_files = sorted(path.glob("*.qasm"))
-            if chunk_files:
-                window = ChunkTabsWindow(chunk_files)
-            else:
-                window = MainWindow(file_to_load=None)
+        if path.exists() and path.suffix.lower() == ".dqc":
+            document = parse_dqc_text(path.read_text())
+            chunk_texts = [(f"Chunk {chunk.index}", chunk.text) for chunk in document.chunks]
+            window = ChunkTabsWindow(chunk_texts, f"QASM3 Aer Lab - {path.name}")
         else:
             window = MainWindow(file_to_load=args.file)
     else:

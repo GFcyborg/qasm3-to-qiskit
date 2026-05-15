@@ -1,0 +1,5 @@
+OPENQASM 3.0;
+qubit[1] q;
+pragma dqc.v1.split id=1
+bit[1] c;
+c = measure q;

@@ -1,8 +1,0 @@
-{
-  "original_file": "/home/gf/Documents/SPDM801_thesis/qasm3-to-qiskit/examples/qiskit-example_3.1.qasm",
-  "chunk_count": 2,
-  "chunk_files": [
-    "/home/gf/Documents/SPDM801_thesis/qasm3-to-qiskit/chunks/qiskit-example_3.1/qiskit-example_3.1_1.qasm",
-    "/home/gf/Documents/SPDM801_thesis/qasm3-to-qiskit/chunks/qiskit-example_3.1/qiskit-example_3.1_2.qasm"
-  ]
-}

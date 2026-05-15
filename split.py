@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import sys
 import subprocess
-import tempfile
 import json
 import shutil
 from pathlib import Path
@@ -32,6 +31,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QTabWidget,
+    QStackedWidget,
     QInputDialog,
     QLineEdit,
     QToolBar,
@@ -39,6 +39,13 @@ from PySide6.QtWidgets import (
 
 from openqasm3 import parse
 from qasm_rewriter import transpile_qasm, kind, span, node_iter, stdgates_compat_lines
+from dqc_container import (
+    DqcDocument,
+    display_split_lines_to_raw_split_after_lines,
+    is_dqc_pragma_line,
+    parse_dqc_text,
+    render_dqc_text,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -82,6 +89,25 @@ def apply_gray_include_format(widget: QPlainTextEdit, text: str) -> None:
         cursor = QTextCursor(block)
         cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock, QTextCursor.MoveMode.KeepAnchor)
         cursor.setCharFormat(include_format)
+
+
+def apply_gray_line_numbers(widget: QPlainTextEdit, line_numbers: set[int]) -> None:
+    """Gray out exact 1-indexed lines in a plain-text widget."""
+    if not line_numbers:
+        return
+
+    line_format = QTextCharFormat()
+    line_format.setForeground(QColor("#303030"))
+    line_format.setBackground(QColor("#e0e0e0"))
+
+    document = widget.document()
+    for line_number in sorted(line_numbers):
+        block = document.findBlockByNumber(line_number - 1)
+        if not block.isValid():
+            continue
+        cursor = QTextCursor(block)
+        cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock, QTextCursor.MoveMode.KeepAnchor)
+        cursor.setCharFormat(line_format)
 
 
 @dataclass(slots=True)
@@ -135,11 +161,19 @@ class CodeEditor(QPlainTextEdit):
 
     def add_split_point(self, line: int) -> None:
         """Mark a split point at line (1-indexed, means split AFTER this line)."""
+        window = self.window()
+        if isinstance(window, SplitWindow):
+            window.on_split_point_added(line)
+            return
         self.split_points.add(line)
         self.line_number_area.update()
 
     def remove_split_point(self, line: int) -> None:
         """Remove a split point."""
+        window = self.window()
+        if isinstance(window, SplitWindow):
+            window.on_split_point_removed(line)
+            return
         self.split_points.discard(line)
         self.line_number_area.update()
 
@@ -211,17 +245,24 @@ class SplitWindow(QMainWindow):
         self.setWindowTitle("QASM3 Splitter")
         self.setGeometry(100, 100, 1400, 900)
         self.current_file: Path | None = None
-        self.current_chunks_dir: Path | None = None  # Track if we're viewing chunks
+        self.current_dqc_file: Path | None = None
         self.current_program: Any | None = None
+        self.current_dqc_document: DqcDocument | None = None
         self.font_size = 10
         
         # Left pane: original code with split markers
         self.editor = CodeEditor()
         editor_panel, _ = self.make_titled_panel("Original QASM (right-click to toggle split)", "#d8ecff", self.editor)
         
-        # Right pane: tabbed chunks
+        # Right pane: rewritten preview or tabbed chunks
+        self.rewritten_chunk_view = QPlainTextEdit()
+        self.rewritten_chunk_view.setReadOnly(True)
+        self.rewritten_chunk_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self.chunk_tabs = QTabWidget()
-        chunk_panel, _ = self.make_titled_panel("Chunks (rewritten)", "#ffe7c2", self.chunk_tabs)
+        self.chunk_stack = QStackedWidget()
+        self.chunk_stack.addWidget(self.rewritten_chunk_view)
+        self.chunk_stack.addWidget(self.chunk_tabs)
+        chunk_panel, _ = self.make_titled_panel("Chunks (rewritten)", "#ffe7c2", self.chunk_stack)
         
         # Main horizontal splitter (full height)
         main_splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -288,14 +329,10 @@ class SplitWindow(QMainWindow):
     def build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("File")
         
-        open_action = QAction("Open QASM file...", self)
+        open_action = QAction("Open QASM/DQC file...", self)
         open_action.triggered.connect(self.open_file)
         file_menu.addAction(open_action)
-        
-        open_chunks_action = QAction("Open chunks directory...", self)
-        open_chunks_action.triggered.connect(self.open_chunks_directory)
-        file_menu.addAction(open_chunks_action)
-        
+
         file_menu.addSeparator()
         
         examples_menu = file_menu.addMenu("Examples")
@@ -326,7 +363,7 @@ class SplitWindow(QMainWindow):
 
     def apply_font(self) -> None:
         font = QFont("DejaVu Sans Mono", self.font_size)
-        for widget in (self.editor, self.chunk_tabs):
+        for widget in (self.editor, self.rewritten_chunk_view, self.chunk_tabs):
             widget.setFont(font)
 
     def set_font_size(self, size: int) -> None:
@@ -335,27 +372,23 @@ class SplitWindow(QMainWindow):
 
     def open_file(self) -> None:
         name, _ = QFileDialog.getOpenFileName(
-            self, "Open QASM", str(EXAMPLES), "QASM files (*.qasm);;All files (*)"
+            self, "Open QASM or DQC", str(EXAMPLES), "QASM/DQC files (*.qasm *.dqc);;All files (*)"
         )
         if name:
             self.load_file(Path(name))
 
-    def open_chunks_directory(self) -> None:
-        """Open a chunks directory to view/run existing chunks."""
-        dir_path = QFileDialog.getExistingDirectory(
-            self, "Open chunks directory", str(ROOT / "chunks")
-        )
-        if dir_path:
-            self.load_chunks_directory(Path(dir_path))
-
     def load_file(self, path: Path) -> None:
+        if path.suffix.lower() == ".dqc":
+            self.load_dqc_file(path)
+            return
         try:
             text = path.read_text()
             self.editor.setPlainText(text)
             self.editor.split_points.clear()
             self.current_file = path
-            self.current_chunks_dir = None
+            self.current_dqc_file = None
             self.current_program = None
+            self.current_dqc_document = None
             
             # Parse to get statements and mark them
             try:
@@ -363,7 +396,8 @@ class SplitWindow(QMainWindow):
             except Exception:
                 pass
             
-            self.chunk_tabs.clear()
+            apply_gray_line_numbers(self.editor, set())
+            self.refresh_chunk_view()
             self.split_button.setEnabled(True)
             self.run_button.setEnabled(False)
             self.status_label.setText(f"Loaded {path.name}")
@@ -372,49 +406,31 @@ class SplitWindow(QMainWindow):
             QMessageBox.critical(self, "Load failed", str(exc))
             self.status_label.setText("Load failed")
 
-    def load_chunks_directory(self, chunks_dir: Path) -> None:
-        """Load and display all chunks from a chunks directory."""
+    def load_dqc_file(self, path: Path) -> None:
         try:
-            # Find all chunk files
-            chunk_files = sorted(chunks_dir.glob("*.qasm"))
-            if not chunk_files:
-                QMessageBox.warning(self, "No chunks", f"No .qasm files found in {chunks_dir}")
-                return
-            
-            # Load metadata if available
-            metadata_file = chunks_dir / ".split_metadata.json"
-            original_file = None
-            if metadata_file.exists():
-                try:
-                    metadata = json.loads(metadata_file.read_text())
-                    original_file = metadata.get("original_file")
-                except Exception:
-                    pass
-            
-            # Load chunks into tabs
+            text = path.read_text()
+            document = parse_dqc_text(text)
+
             self.current_file = None
-            self.current_chunks_dir = chunks_dir
+            self.current_dqc_file = path
             self.current_program = None
-            self.editor.setPlainText("")
-            self.editor.split_points.clear()
-            self.chunk_tabs.clear()
-            
-            for chunk_file in chunk_files:
-                tab = QPlainTextEdit()
-                tab.setReadOnly(True)
-                tab.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-                tab.setFont(QFont("DejaVu Sans Mono", self.font_size))
-                content = chunk_file.read_text()
-                apply_gray_include_format(tab, content)
-                self.chunk_tabs.addTab(tab, chunk_file.stem)
-            
-            self.split_button.setEnabled(False)  # Can't split chunks directory
-            self.run_button.setEnabled(True)  # Can run the chunks
-            msg = f"Loaded {len(chunk_files)} chunks from {chunks_dir.name}"
-            if original_file:
-                msg += f"\nOriginal: {original_file}"
-            self.status_label.setText(msg)
-            self.setWindowTitle(f"QASM3 Splitter - Chunks: {chunks_dir.resolve()}")
+            self.current_dqc_document = document
+
+            try:
+                self.current_program = parse(document.raw_text)
+            except Exception:
+                pass
+
+            self.editor.setPlainText(text)
+            self.editor.split_points = set(document.pragma_line_numbers)
+            self.editor.line_number_area.update()
+            apply_gray_line_numbers(self.editor, document.pragma_line_numbers)
+
+            self.refresh_chunk_view()
+            self.split_button.setEnabled(True)
+            self.run_button.setEnabled(True)
+            self.status_label.setText(f"Loaded {path.name}")
+            self.setWindowTitle(f"QASM3 Splitter - {path.resolve()}")
         except Exception as exc:
             QMessageBox.critical(self, "Load failed", str(exc))
             self.status_label.setText("Load failed")
@@ -452,6 +468,12 @@ class SplitWindow(QMainWindow):
         """
         if self.current_program is None:
             return True
+
+        if self.current_dqc_document is not None:
+            document = parse_dqc_text(self.editor.toPlainText())
+            if line in document.pragma_line_numbers:
+                return True
+            line = document.display_to_raw_after_line.get(line, line)
 
         # Kinds whose spans define inner scopes we should not split inside
         blocking_kinds = {
@@ -492,26 +514,79 @@ class SplitWindow(QMainWindow):
         """Generate and preview chunks. Returns list of (name, original, rewritten)."""
         if not self.editor.toPlainText():
             return []
-        
+
+        if self.current_dqc_document is not None:
+            document = parse_dqc_text(self.editor.toPlainText())
+            result: list[tuple[str, str, str]] = []
+            for chunk in document.chunks:
+                try:
+                    rewritten, _, _ = transpile_qasm(chunk.text)
+                except Exception as exc:
+                    rewritten = f"[ERROR: {exc}]"
+                result.append((f"Chunk {chunk.index}", chunk.text, rewritten))
+            return result
+
         original_text = self.editor.toPlainText()
         chunks = self.extract_chunks_by_lines(original_text, self.editor.split_points)
-        
+
         result: list[tuple[str, str, str]] = []
         for i, chunk_text in enumerate(chunks, 1):
             try:
                 rewritten, _, _ = transpile_qasm(chunk_text)
             except Exception as exc:
                 rewritten = f"[ERROR: {exc}]"
-            
+
             result.append((f"Chunk {i}", chunk_text, rewritten))
-        
+
         return result
 
-    def refresh_chunk_tabs(self) -> None:
-        """Refresh the chunk preview tabs."""
-        self.chunk_tabs.clear()
+    def refresh_chunk_view(self) -> None:
+        """Refresh the rewritten preview or split chunk tabs."""
+        if not self.current_file and self.current_dqc_document is None:
+            return
+
+        if self.current_dqc_document is not None:
+            document = parse_dqc_text(self.editor.toPlainText())
+            chunks = document.chunks
+
+            if len(chunks) <= 1 or not self.editor.split_points:
+                self.chunk_stack.setCurrentWidget(self.rewritten_chunk_view)
+                rewritten = ""
+                if chunks:
+                    try:
+                        rewritten, _, _ = transpile_qasm(document.raw_text)
+                    except Exception as exc:
+                        rewritten = f"[ERROR: {exc}]"
+                apply_gray_include_format(self.rewritten_chunk_view, rewritten)
+                return
+
+            self.chunk_stack.setCurrentWidget(self.chunk_tabs)
+            self.chunk_tabs.clear()
+
+            for chunk in chunks:
+                tab = QPlainTextEdit()
+                tab.setReadOnly(True)
+                tab.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+                tab.setFont(QFont("DejaVu Sans Mono", self.font_size))
+                try:
+                    rewritten, _, _ = transpile_qasm(chunk.text)
+                except Exception as exc:
+                    rewritten = f"[ERROR: {exc}]"
+                apply_gray_include_format(tab, rewritten)
+                self.chunk_tabs.addTab(tab, f"Chunk {chunk.index}")
+            return
+
         chunks = self.preview_chunks()
-        
+
+        if not self.editor.split_points:
+            self.chunk_stack.setCurrentWidget(self.rewritten_chunk_view)
+            rewritten = chunks[0][2] if chunks else ""
+            apply_gray_include_format(self.rewritten_chunk_view, rewritten)
+            return
+
+        self.chunk_stack.setCurrentWidget(self.chunk_tabs)
+        self.chunk_tabs.clear()
+
         for name, _, rewritten in chunks:
             tab = QPlainTextEdit()
             tab.setReadOnly(True)
@@ -520,85 +595,139 @@ class SplitWindow(QMainWindow):
             apply_gray_include_format(tab, rewritten)
             self.chunk_tabs.addTab(tab, name)
 
+    def refresh_chunk_tabs(self) -> None:
+        """Backward-compatible alias for refreshing the chunk view."""
+        self.refresh_chunk_view()
+
+    def on_split_point_added(self, line: int) -> None:
+        if self.current_dqc_document is None:
+            self.editor.split_points.add(line)
+            self.editor.line_number_area.update()
+            self.refresh_chunk_view()
+            return
+
+        document = parse_dqc_text(self.editor.toPlainText())
+        raw_text = document.raw_text
+        raw_split_after_lines = display_split_lines_to_raw_split_after_lines(
+            document,
+            self.editor.split_points | {line},
+        )
+        dqc_text = render_dqc_text(raw_text, raw_split_after_lines)
+        updated = parse_dqc_text(dqc_text)
+        self.current_dqc_document = updated
+        self.editor.setPlainText(updated.source_text)
+        self.editor.split_points = set(updated.pragma_line_numbers)
+        self.editor.line_number_area.update()
+        apply_gray_line_numbers(self.editor, updated.pragma_line_numbers)
+        self.refresh_chunk_view()
+
+    def on_split_point_removed(self, line: int) -> None:
+        if self.current_dqc_document is None:
+            self.editor.split_points.discard(line)
+            self.editor.line_number_area.update()
+            self.refresh_chunk_view()
+            return
+
+        document = parse_dqc_text(self.editor.toPlainText())
+        raw_text = document.raw_text
+        raw_split_after_lines = display_split_lines_to_raw_split_after_lines(
+            document,
+            {split_line for split_line in self.editor.split_points if split_line != line},
+        )
+        dqc_text = render_dqc_text(raw_text, raw_split_after_lines)
+        updated = parse_dqc_text(dqc_text)
+        self.current_dqc_document = updated
+        self.editor.setPlainText(updated.source_text)
+        self.editor.split_points = set(updated.pragma_line_numbers)
+        self.editor.line_number_area.update()
+        apply_gray_line_numbers(self.editor, updated.pragma_line_numbers)
+        self.refresh_chunk_view()
+
     def save_chunks(self) -> None:
-        """Save chunks to disk in chunks/<filename>/ directory."""
-        if not self.current_file:
-            QMessageBox.warning(self, "No file", "Load a QASM file first")
+        """Save the current split state as a single DQC file."""
+        if not self.current_file and self.current_dqc_file is None:
+            QMessageBox.warning(self, "No file", "Load a QASM or DQC file first")
             return
-        
-        chunks_data = self.preview_chunks()
-        if not chunks_data:
-            QMessageBox.warning(self, "No chunks", "No content to split")
+
+        base_name = self.current_file.stem if self.current_file else (self.current_dqc_file.stem if self.current_dqc_file else None)
+        if not base_name:
+            QMessageBox.warning(self, "No chunks", "No file name available to save")
             return
-        
-        # Create output directory: chunks/<filename>/
-        base_name = self.current_file.stem
+
         chunks_parent = ROOT / "chunks"
         chunks_parent.mkdir(exist_ok=True)
         out_dir = chunks_parent / base_name
         clear_directory_contents(out_dir)
-        
-        # Save chunks
-        chunk_files: list[Path] = []
-        for i, (_, original, rewritten) in enumerate(chunks_data, 1):
-            chunk_file = out_dir / f"{base_name}_{i}.qasm"
-            chunk_file.write_text(rewritten)
-            chunk_files.append(chunk_file)
-        
-        # Save metadata
-        metadata = {
-            "original_file": str(self.current_file),
-            "chunk_count": len(chunks_data),
-            "chunk_files": [str(f) for f in chunk_files],
-        }
-        metadata_file = out_dir / ".split_metadata.json"
-        metadata_file.write_text(json.dumps(metadata, indent=2))
-        
+
+        if self.current_dqc_document is not None:
+            document = parse_dqc_text(self.editor.toPlainText())
+            raw_text = document.raw_text
+            split_after_lines = document.raw_split_after_lines
+        else:
+            raw_text = self.editor.toPlainText()
+            split_after_lines = set(self.editor.split_points)
+
+        dqc_text = render_dqc_text(raw_text, split_after_lines)
+        dqc_file = out_dir / f"{base_name}.dqc"
+        dqc_file.write_text(dqc_text)
+
+        self.current_dqc_file = dqc_file
+        self.current_dqc_document = parse_dqc_text(dqc_text)
+        self.editor.setPlainText(self.current_dqc_document.source_text)
+        self.editor.split_points = set(self.current_dqc_document.pragma_line_numbers)
+        self.editor.line_number_area.update()
+        apply_gray_line_numbers(self.editor, self.current_dqc_document.pragma_line_numbers)
+
+        self.split_button.setEnabled(True)
         self.run_button.setEnabled(True)
-        self.status_label.setText(f"Saved {len(chunks_data)} chunks to chunks/{base_name}/")
+        self.refresh_chunk_view()
+        
+        self.status_label.setText(f"Saved DQC file to chunks/{base_name}/{base_name}.dqc")
         QMessageBox.information(
             self,
-            "Chunks saved",
-            f"Saved {len(chunks_data)} chunks to:\n{out_dir}",
+            "DQC saved",
+            f"Saved DQC file to:\n{dqc_file}",
         )
 
     def run_chunks(self) -> None:
-        """Launch independent run.py windows for each chunk."""
-        if self.current_chunks_dir:
-            # Running chunks from a directory
-            chunks_dir = self.current_chunks_dir
-        elif self.current_file:
-            # Running chunks from a split file
-            base_name = self.current_file.stem
-            chunks_parent = ROOT / "chunks"
-            chunks_dir = chunks_parent / base_name
+        """Launch run.py in tabbed mode using the current DQC file."""
+        if not self.current_file and self.current_dqc_file is None:
+            QMessageBox.warning(self, "No chunks", "Load a QASM or DQC file first")
+            return
+
+        base_name = self.current_file.stem if self.current_file else (self.current_dqc_file.stem if self.current_dqc_file else None)
+        if not base_name:
+            QMessageBox.warning(self, "No chunks", "No file name available to run")
+            return
+
+        chunks_parent = ROOT / "chunks"
+        chunks_parent.mkdir(exist_ok=True)
+        chunks_dir = chunks_parent / base_name
+
+        if self.current_dqc_document is not None:
+            document = parse_dqc_text(self.editor.toPlainText())
+            raw_text = document.raw_text
+            split_after_lines = document.raw_split_after_lines
         else:
-            QMessageBox.warning(self, "No chunks", "Load a QASM file or chunks directory first")
-            return
-        
-        if not chunks_dir.exists():
-            QMessageBox.warning(self, "No chunks directory", f"Directory not found: {chunks_dir}")
-            return
-        
-        # Find chunk files
-        base_name = chunks_dir.name
-        chunk_files = sorted(chunks_dir.glob(f"{base_name}_*.qasm"))
-        if not chunk_files:
-            QMessageBox.warning(self, "No chunk files", f"No chunks found in {chunks_dir}")
-            return
+            raw_text = self.editor.toPlainText()
+            split_after_lines = set(self.editor.split_points)
+
+        clear_directory_contents(chunks_dir)
+        dqc_file = chunks_dir / f"{base_name}.dqc"
+        dqc_file.write_text(render_dqc_text(raw_text, split_after_lines))
         
         try:
-            # Launch a single run.py and pass the chunks directory so it opens tabs
             script = ROOT / "run.py"
             subprocess.Popen(
-                [sys.executable, str(script), str(chunks_dir)],
+                [sys.executable, str(script), str(dqc_file)],
                 cwd=str(ROOT),
             )
         except Exception as exc:
             QMessageBox.critical(self, "Launch failed", f"Failed to launch run.py: {exc}")
             return
 
-        self.status_label.setText(f"Launched run.py for chunks in {chunks_dir.name}")
+        self.current_dqc_file = dqc_file
+        self.status_label.setText(f"Launched run.py for {dqc_file.name}")
 
 
 def main() -> int:
