@@ -1527,7 +1527,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"'{query}' not found", 3000)
 
     def open_file(self) -> None:
-        name, _ = QFileDialog.getOpenFileName(self, "Open QASM/DQC", str(EXAMPLES), "QASM/DQC files (*.qasm *.inc *.dqc);;All files (*)")
+        name, _ = QFileDialog.getOpenFileName(self, "Open QASM", str(EXAMPLES), "QASM files (*.qasm *.inc);;All files (*)")
         if name:
             self.load_path(Path(name))
 
@@ -2197,7 +2197,8 @@ class ChunkTabsWindow(QMainWindow):
 def main() -> int:
     import argparse
     parser = argparse.ArgumentParser(description="QASM3 Aer Lab - Test OpenQASM 3 with Qiskit")
-    parser.add_argument("file", nargs="?", default=None, help="QASM file or directory to load on startup")
+    parser.add_argument("file", nargs="?", default=None, help="QASM file or directory to load on startup (no .dqc)")
+    parser.add_argument("--chunks-stdin", action="store_true", help="Read JSON list of (title,text) chunks from stdin and open them as tabs")
     args = parser.parse_args()
     
     app = QApplication(sys.argv)
@@ -2205,15 +2206,22 @@ def main() -> int:
     app.setOrganizationName("Copilot")
 
     window: QMainWindow
-    if args.file:
+    if args.chunks_stdin:
+        # Read JSON list of [title, text] from stdin
+        try:
+            raw = sys.stdin.read()
+            data = json.loads(raw)
+            # Expect a list of [title, text] pairs
+            chunk_texts: list[tuple[str, str]] = [(str(t), str(s)) for t, s in data]
+        except Exception as exc:
+            print(f"Failed to read chunks from stdin: {exc}", file=sys.stderr)
+            return 2
+        window = ChunkTabsWindow(chunk_texts, "QASM3 Aer Lab - chunks")
+    elif args.file:
         path = Path(args.file)
         if path.exists() and path.suffix.lower() == ".dqc":
-            document = parse_dqc_text(path.read_text())
-            chunk_texts = [
-                (f"Chunk {chunk.index}", prepare_chunk_text_for_run(chunk.text, document.raw_text))
-                for chunk in document.chunks
-            ]
-            window = ChunkTabsWindow(chunk_texts, f"QASM3 Aer Lab - {path.name}")
+            print("Error: .dqc files are not supported by run.py. Use split.py to handle DQC files.", file=sys.stderr)
+            return 2
         else:
             window = MainWindow(file_to_load=args.file)
     else:

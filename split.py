@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
 
 from openqasm3 import parse
 from qasm_rewriter import kind, span, node_iter, stdgates_compat_lines
+import re
 try:
     # Prefer the lightweight minimal transpiler used by run.py (keeps stdgates include)
     from run import minimal_transpile as transpile_for_split
@@ -505,6 +506,80 @@ class SplitWindow(QMainWindow):
         
         return chunks
 
+
+    def _collect_defined_and_used(self, text: str) -> tuple[set[str], set[str]]:
+        """Return (defined_names, used_identifiers) found in `text` using the parser.
+
+        Falls back to empty sets if parsing fails.
+        """
+        # Ensure minimal header and stdgates include to aid parsing
+        t = text
+        try:
+            has_header = bool(re.search(r"(?mi)^[ \t]*OPENQASM\b", t))
+            if not has_header:
+                t = "OPENQASM 3.0;\n" + t
+            has_stdgates = bool(re.search(r'(?mi)^\s*include\s+"stdgates\.inc"\s*;', t))
+            if not has_stdgates:
+                lines = t.splitlines()
+                insert_at = 1 if lines and lines[0].strip().upper().startswith("OPENQASM") else 0
+                lines.insert(insert_at, 'include "stdgates.inc";')
+                t = "\n".join(lines)
+
+            prog = parse(t)
+        except Exception:
+            return set(), set()
+
+        defined: set[str] = set()
+        used: set[str] = set()
+        try:
+            for stmt in getattr(prog, "statements", []):
+                k = kind(stmt)
+                if k == "QuantumGateDefinition":
+                    name_obj = getattr(stmt, "name", None) or getattr(stmt, "identifier", None)
+                    name = getattr(name_obj, "name", None)
+                    if name:
+                        defined.add(name)
+                else:
+                    name = getattr(getattr(stmt, "identifier", None), "name", None)
+                    if name:
+                        defined.add(name)
+
+            for node in node_iter(prog):
+                if kind(node) == "Identifier":
+                    n = getattr(node, "name", "")
+                    if n:
+                        used.add(n)
+        except Exception:
+            return set(), set()
+
+        return defined, used
+
+
+    def _compute_chunk_references(self, chunk_texts: list[str]) -> list[set[str]]:
+        """Compute for each chunk the set of identifiers it references that were defined in earlier chunks."""
+        # Gather stdgates names to treat as globally defined
+        stdgates_names: set[str] = set()
+        for defline in stdgates_compat_lines():
+            m = re.match(r"^gate\s+([A-Za-z_]\w*)", defline)
+            if m:
+                stdgates_names.add(m.group(1))
+
+        cumulative_defined: set[str] = set(stdgates_names)
+        results: list[set[str]] = []
+
+        for text in chunk_texts:
+            defined, used = self._collect_defined_and_used(text)
+            # referenced from previous chunks = used intersection cumulative_defined
+            referenced = set(sorted(name for name in used if name in cumulative_defined))
+            results.append(referenced)
+            cumulative_defined.update(defined)
+
+        # The first chunk cannot reference previous chunks (there are none).
+        if results:
+            results[0] = set()
+
+        return results
+
     def is_line_splittable(self, line: int) -> bool:
         """Return True if the given 1-indexed line is a top-level location where splitting is allowed.
 
@@ -588,18 +663,42 @@ class SplitWindow(QMainWindow):
             self.chunk_stack.setCurrentWidget(self.chunk_tabs)
             self.chunk_tabs.clear()
 
-            for chunk in chunks:
-                tab = QPlainTextEdit()
-                tab.setReadOnly(True)
-                tab.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-                tab.setFont(QFont("DejaVu Sans Mono", self.font_size))
+            # Compute references for each chunk (identifiers referenced from previous chunks)
+            chunk_texts = [c.text for c in chunks]
+            refs_list = self._compute_chunk_references(chunk_texts)
+
+            for chunk, refs in zip(chunks, refs_list):
+                # Container widget with top references area and bottom rewritten code
+                container = QWidget()
+                v = QVBoxLayout(container)
+                v.setContentsMargins(0, 0, 0, 0)
+                v.setSpacing(2)
+
+                refs_view = QPlainTextEdit()
+                refs_view.setReadOnly(True)
+                refs_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+                refs_view.setFont(QFont("DejaVu Sans Mono", max(8, self.font_size - 2)))
+                if refs:
+                    refs_view.setPlainText("\n".join(sorted(refs)))
+                else:
+                    refs_view.setPlainText("(no references from previous chunks)")
+                refs_view.setFixedHeight(24 + 16 * min(4, len(refs)))
+
+                bottom = QPlainTextEdit()
+                bottom.setReadOnly(True)
+                bottom.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+                bottom.setFont(QFont("DejaVu Sans Mono", self.font_size))
                 try:
                     chunk_text = prepare_chunk_text_for_run(chunk.text, document.raw_text)
                     rewritten, _, _ = transpile_for_split(chunk_text)
                 except Exception as exc:
                     rewritten = f"[ERROR: {exc}]"
-                apply_gray_include_format(tab, rewritten)
-                self.chunk_tabs.addTab(tab, f"Chunk {chunk.index}")
+                apply_gray_include_format(bottom, rewritten)
+
+                v.addWidget(refs_view)
+                v.addWidget(bottom)
+
+                self.chunk_tabs.addTab(container, f"Chunk {chunk.index}")
             return
 
         chunks = self.preview_chunks()
@@ -613,13 +712,36 @@ class SplitWindow(QMainWindow):
         self.chunk_stack.setCurrentWidget(self.chunk_tabs)
         self.chunk_tabs.clear()
 
-        for name, _, rewritten in chunks:
-            tab = QPlainTextEdit()
-            tab.setReadOnly(True)
-            tab.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-            tab.setFont(QFont("DejaVu Sans Mono", self.font_size))
-            apply_gray_include_format(tab, rewritten)
-            self.chunk_tabs.addTab(tab, name)
+        # For non-DQC chunks, chunks is a list of (name, original, rewritten)
+        original_texts = [orig for _, orig, _ in chunks]
+        refs_list = self._compute_chunk_references(original_texts)
+
+        for (name, _, rewritten), refs in zip(chunks, refs_list):
+            container = QWidget()
+            v = QVBoxLayout(container)
+            v.setContentsMargins(0, 0, 0, 0)
+            v.setSpacing(2)
+
+            refs_view = QPlainTextEdit()
+            refs_view.setReadOnly(True)
+            refs_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+            refs_view.setFont(QFont("DejaVu Sans Mono", max(8, self.font_size - 2)))
+            if refs:
+                refs_view.setPlainText("\n".join(sorted(refs)))
+            else:
+                refs_view.setPlainText("(no references from previous chunks)")
+            refs_view.setFixedHeight(24 + 16 * min(4, len(refs)))
+
+            bottom = QPlainTextEdit()
+            bottom.setReadOnly(True)
+            bottom.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+            bottom.setFont(QFont("DejaVu Sans Mono", self.font_size))
+            apply_gray_include_format(bottom, rewritten)
+
+            v.addWidget(refs_view)
+            v.addWidget(bottom)
+
+            self.chunk_tabs.addTab(container, name)
 
     def refresh_chunk_tabs(self) -> None:
         """Backward-compatible alias for refreshing the chunk view."""
@@ -726,34 +848,33 @@ class SplitWindow(QMainWindow):
             QMessageBox.warning(self, "No chunks", "No file name available to run")
             return
 
-        chunks_parent = EXAMPLES / "chunks"
-        chunks_parent.mkdir(parents=True, exist_ok=True)
-        chunks_dir = chunks_parent / base_name
-
+        # Prepare chunk texts and pass them to run.py via stdin as JSON
         if self.current_dqc_document is not None:
             document = parse_dqc_text(self.editor.toPlainText())
-            raw_text = document.raw_text
-            split_after_lines = document.raw_split_after_lines
+            chunks = [(f"Chunk {chunk.index}", prepare_chunk_text_for_run(chunk.text, document.raw_text)) for chunk in document.chunks]
         else:
-            raw_text = self.editor.toPlainText()
-            split_after_lines = set(self.editor.split_points)
+            original_text = self.editor.toPlainText()
+            piece_texts = self.extract_chunks_by_lines(original_text, set(self.editor.split_points))
+            chunks = [(f"Chunk {i}", prepare_chunk_text_for_run(text, original_text)) for i, text in enumerate(piece_texts, 1)]
 
-        clear_directory_contents(chunks_dir)
-        dqc_file = chunks_dir / f"{base_name}.dqc"
-        dqc_file.write_text(render_dqc_text(raw_text, split_after_lines))
-        
         try:
             script = ROOT / "run.py"
-            subprocess.Popen(
-                [sys.executable, str(script), str(dqc_file)],
+            proc = subprocess.Popen(
+                [sys.executable, str(script), "--chunks-stdin"],
+                stdin=subprocess.PIPE,
                 cwd=str(ROOT),
             )
+            payload = json.dumps(chunks)
+            # Write and close stdin so the child can proceed
+            if proc.stdin:
+                proc.stdin.write(payload.encode("utf-8"))
+                proc.stdin.close()
         except Exception as exc:
             QMessageBox.critical(self, "Launch failed", f"Failed to launch run.py: {exc}")
             return
 
-        self.current_dqc_file = dqc_file
-        self.status_label.setText(f"Launched run.py for {dqc_file.name}")
+        self.current_dqc_file = None
+        self.status_label.setText(f"Launched run.py with {len(chunks)} chunks")
 
 
 def main() -> int:
