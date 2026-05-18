@@ -298,7 +298,7 @@ class SplitWindow(QMainWindow):
         
         # Left pane: original code with split markers
         self.editor = CodeEditor()
-        editor_panel, _ = self.make_titled_panel("Original QASM (right-click to toggle split)", "#d8ecff", self.editor)
+        editor_panel, _ = self.make_titled_panel("QASM original (right-click to toggle split)", "#d8ecff", self.editor)
         
         # Right pane: rewritten preview or tabbed chunks
         self.rewritten_chunk_view = QPlainTextEdit()
@@ -415,6 +415,7 @@ class SplitWindow(QMainWindow):
     def set_font_size(self, size: int) -> None:
         self.font_size = size
         self.apply_font()
+        self.refresh_chunk_view()
 
     def open_file(self) -> None:
         name, _ = QFileDialog.getOpenFileName(
@@ -507,8 +508,8 @@ class SplitWindow(QMainWindow):
         return chunks
 
 
-    def _collect_defined_and_used(self, text: str) -> tuple[set[str], set[str]]:
-        """Return (defined_names, used_identifiers) found in `text` using the parser.
+    def _collect_defined_and_used(self, text: str) -> tuple[set[str], set[str], set[str]]:
+        """Return (defined_names, qubit_defined_names, used_identifiers) found in `text`.
 
         Falls back to empty sets if parsing fails.
         """
@@ -527,14 +528,22 @@ class SplitWindow(QMainWindow):
 
             prog = parse(t)
         except Exception:
-            return set(), set()
+            return set(), set(), set()
 
         defined: set[str] = set()
+        qubit_defined: set[str] = set()
         used: set[str] = set()
         try:
             for stmt in getattr(prog, "statements", []):
                 k = kind(stmt)
-                if k == "QuantumGateDefinition":
+                if k == "QubitDeclaration":
+                    # AST may name the declared identifier either `identifier` or `qubit`
+                    name_obj = getattr(stmt, "identifier", None) or getattr(stmt, "qubit", None)
+                    name = getattr(name_obj, "name", None)
+                    if name:
+                        defined.add(name)
+                        qubit_defined.add(name)
+                elif k == "QuantumGateDefinition":
                     name_obj = getattr(stmt, "name", None) or getattr(stmt, "identifier", None)
                     name = getattr(name_obj, "name", None)
                     if name:
@@ -545,17 +554,24 @@ class SplitWindow(QMainWindow):
                         defined.add(name)
 
             for node in node_iter(prog):
-                if kind(node) == "Identifier":
+                k = kind(node)
+                if k == "Identifier":
                     n = getattr(node, "name", "")
                     if n:
                         used.add(n)
+                elif k == "IndexedIdentifier":
+                    # capture base collection name (e.g., `q` from `q[0]`)
+                    name_obj = getattr(node, "name", None)
+                    n = getattr(name_obj, "name", "")
+                    if n:
+                        used.add(n)
         except Exception:
-            return set(), set()
+            return set(), set(), set()
 
-        return defined, used
+        return defined, qubit_defined, used
 
 
-    def _compute_chunk_references(self, chunk_texts: list[str]) -> list[set[str]]:
+    def _compute_chunk_references(self, chunk_texts: list[str]) -> list[tuple[set[str], set[str]]]:
         """Compute for each chunk the set of identifiers it references that were defined in earlier chunks."""
         # Gather stdgates names to treat as globally defined
         stdgates_names: set[str] = set()
@@ -565,20 +581,56 @@ class SplitWindow(QMainWindow):
                 stdgates_names.add(m.group(1))
 
         cumulative_defined: set[str] = set(stdgates_names)
-        results: list[set[str]] = []
+        cumulative_qubits: set[str] = set()
+        results: list[tuple[set[str], set[str]]] = []
 
         for text in chunk_texts:
-            defined, used = self._collect_defined_and_used(text)
-            # referenced from previous chunks = used intersection cumulative_defined
-            referenced = set(sorted(name for name in used if name in cumulative_defined))
-            results.append(referenced)
+            defined, qubit_defined, used = self._collect_defined_and_used(text)
+            referenced_qubits = {name for name in used if name in cumulative_qubits}
+            referenced_other = {name for name in used if name in cumulative_defined and name not in cumulative_qubits}
+            results.append((referenced_qubits, referenced_other))
             cumulative_defined.update(defined)
+            cumulative_qubits.update(qubit_defined)
 
         # The first chunk cannot reference previous chunks (there are none).
         if results:
-            results[0] = set()
+            results[0] = (set(), set())
 
         return results
+
+
+    def _make_reference_panel(self, qubit_refs: set[str], other_refs: set[str]) -> QWidget:
+        """Build the inter-chunk reference area shown above each rewritten chunk."""
+        panel = QWidget()
+        panel.setStyleSheet(
+            "QWidget { background-color: #f2f2f2; border: 1px solid #d0d0d0; border-radius: 3px; }"
+        )
+        panel.setMaximumHeight(54)
+
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(3, 1, 3, 1)
+        layout.setSpacing(0)
+
+        title = QLabel("Inter-Chunk Refs:")
+        title.setStyleSheet("font-size: 8px; font-weight: 600; color: #444444; margin: 0px;")
+        layout.addWidget(title)
+
+        def make_row(label: str, refs: set[str]) -> QLineEdit:
+            row = QLineEdit()
+            row.setReadOnly(True)
+            row.setFrame(False)
+            row.setFont(QFont("DejaVu Sans Mono", self.font_size))
+            row.setStyleSheet(
+                "QLineEdit { background-color: transparent; border: none; padding: 0px; margin: 0px; }"
+            )
+            row.setText(f"{label}: {', '.join(sorted(refs)) if refs else 'none'}")
+            row.setFixedHeight(row.fontMetrics().height() + 2)
+            return row
+
+        layout.addWidget(make_row("Qubits", qubit_refs))
+        layout.addWidget(make_row("Other", other_refs))
+
+        return panel
 
     def is_line_splittable(self, line: int) -> bool:
         """Return True if the given 1-indexed line is a top-level location where splitting is allowed.
@@ -667,22 +719,12 @@ class SplitWindow(QMainWindow):
             chunk_texts = [c.text for c in chunks]
             refs_list = self._compute_chunk_references(chunk_texts)
 
-            for chunk, refs in zip(chunks, refs_list):
+            for chunk, (qubit_refs, other_refs) in zip(chunks, refs_list):
                 # Container widget with top references area and bottom rewritten code
                 container = QWidget()
                 v = QVBoxLayout(container)
                 v.setContentsMargins(0, 0, 0, 0)
                 v.setSpacing(2)
-
-                refs_view = QPlainTextEdit()
-                refs_view.setReadOnly(True)
-                refs_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-                refs_view.setFont(QFont("DejaVu Sans Mono", max(8, self.font_size - 2)))
-                if refs:
-                    refs_view.setPlainText("\n".join(sorted(refs)))
-                else:
-                    refs_view.setPlainText("(no references from previous chunks)")
-                refs_view.setFixedHeight(24 + 16 * min(4, len(refs)))
 
                 bottom = QPlainTextEdit()
                 bottom.setReadOnly(True)
@@ -695,7 +737,7 @@ class SplitWindow(QMainWindow):
                     rewritten = f"[ERROR: {exc}]"
                 apply_gray_include_format(bottom, rewritten)
 
-                v.addWidget(refs_view)
+                v.addWidget(self._make_reference_panel(qubit_refs, other_refs))
                 v.addWidget(bottom)
 
                 self.chunk_tabs.addTab(container, f"Chunk {chunk.index}")
@@ -716,21 +758,11 @@ class SplitWindow(QMainWindow):
         original_texts = [orig for _, orig, _ in chunks]
         refs_list = self._compute_chunk_references(original_texts)
 
-        for (name, _, rewritten), refs in zip(chunks, refs_list):
+        for (name, _, rewritten), (qubit_refs, other_refs) in zip(chunks, refs_list):
             container = QWidget()
             v = QVBoxLayout(container)
             v.setContentsMargins(0, 0, 0, 0)
             v.setSpacing(2)
-
-            refs_view = QPlainTextEdit()
-            refs_view.setReadOnly(True)
-            refs_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-            refs_view.setFont(QFont("DejaVu Sans Mono", max(8, self.font_size - 2)))
-            if refs:
-                refs_view.setPlainText("\n".join(sorted(refs)))
-            else:
-                refs_view.setPlainText("(no references from previous chunks)")
-            refs_view.setFixedHeight(24 + 16 * min(4, len(refs)))
 
             bottom = QPlainTextEdit()
             bottom.setReadOnly(True)
@@ -738,7 +770,7 @@ class SplitWindow(QMainWindow):
             bottom.setFont(QFont("DejaVu Sans Mono", self.font_size))
             apply_gray_include_format(bottom, rewritten)
 
-            v.addWidget(refs_view)
+            v.addWidget(self._make_reference_panel(qubit_refs, other_refs))
             v.addWidget(bottom)
 
             self.chunk_tabs.addTab(container, name)

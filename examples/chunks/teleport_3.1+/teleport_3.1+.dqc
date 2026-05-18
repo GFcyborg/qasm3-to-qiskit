@@ -17,7 +17,6 @@ barrier q;
 cx q[0], q[1];
 h q[0];
 c0 = measure q[0];
-pragma dqc.v1.split id=2
 c1 = measure q[1];
 if(c0   ) z q[2];
 if(c1   ) { x q[2]; }  // braces optional in this case
