@@ -680,8 +680,8 @@ class SplitWindow(QMainWindow):
             QMessageBox.warning(self, "No chunks", "No file name available to save")
             return
 
-        chunks_parent = ROOT / "chunks"
-        chunks_parent.mkdir(exist_ok=True)
+        chunks_parent = EXAMPLES / "chunks"
+        chunks_parent.mkdir(parents=True, exist_ok=True)
         out_dir = chunks_parent / base_name
         clear_directory_contents(out_dir)
 
@@ -708,7 +708,7 @@ class SplitWindow(QMainWindow):
         self.run_button.setEnabled(True)
         self.refresh_chunk_view()
         
-        self.status_label.setText(f"Saved DQC file to chunks/{base_name}/{base_name}.dqc")
+        self.status_label.setText(f"Saved DQC file to examples/chunks/{base_name}/{base_name}.dqc")
         QMessageBox.information(
             self,
             "DQC saved",
@@ -726,8 +726,8 @@ class SplitWindow(QMainWindow):
             QMessageBox.warning(self, "No chunks", "No file name available to run")
             return
 
-        chunks_parent = ROOT / "chunks"
-        chunks_parent.mkdir(exist_ok=True)
+        chunks_parent = EXAMPLES / "chunks"
+        chunks_parent.mkdir(parents=True, exist_ok=True)
         chunks_dir = chunks_parent / base_name
 
         if self.current_dqc_document is not None:
