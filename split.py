@@ -38,7 +38,13 @@ from PySide6.QtWidgets import (
 )
 
 from openqasm3 import parse
-from qasm_rewriter import transpile_qasm, kind, span, node_iter, stdgates_compat_lines
+from qasm_rewriter import kind, span, node_iter, stdgates_compat_lines
+try:
+    # Prefer the lightweight minimal transpiler used by run.py (keeps stdgates include)
+    from run import minimal_transpile as transpile_for_split
+except Exception:
+    # Fall back to the full transpiler if run.py cannot be imported
+    from qasm_rewriter import transpile_qasm as transpile_for_split
 from dqc_container import (
     DqcDocument,
     display_split_lines_to_raw_split_after_lines,
@@ -83,7 +89,13 @@ def clear_directory_contents(path: Path) -> None:
 
 
 def apply_gray_include_format(widget: QPlainTextEdit, text: str) -> None:
-    """Populate a plain-text widget and gray out stdgates include lines."""
+    """Populate a plain-text widget and gray out stdgates include lines.
+
+    The rewritten output produced for the splitter should keep an `include
+    "stdgates.inc";` line instead of inlining the full stdgates definitions.
+    Gray that include line (or, as a fallback, any inlined stdgates definition
+    lines) so users see the compatibility include highlighted.
+    """
     widget.setPlainText(text)
 
     include_format = QTextCharFormat()
@@ -95,11 +107,18 @@ def apply_gray_include_format(widget: QPlainTextEdit, text: str) -> None:
         block = document.findBlockByNumber(block_number)
         if not block.isValid():
             continue
-        if block.text().strip() not in STDGATES_LINE_SET:
+        txt = block.text().strip()
+        # Gray an explicit include line for stdgates
+        if txt.lower() == 'include "stdgates.inc";':
+            cursor = QTextCursor(block)
+            cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock, QTextCursor.MoveMode.KeepAnchor)
+            cursor.setCharFormat(include_format)
             continue
-        cursor = QTextCursor(block)
-        cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock, QTextCursor.MoveMode.KeepAnchor)
-        cursor.setCharFormat(include_format)
+        # Fallback: gray any inlined stdgates definition lines
+        if txt in STDGATES_LINE_SET:
+            cursor = QTextCursor(block)
+            cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock, QTextCursor.MoveMode.KeepAnchor)
+            cursor.setCharFormat(include_format)
 
 
 def apply_gray_line_numbers(widget: QPlainTextEdit, line_numbers: set[int]) -> None:
@@ -525,7 +544,7 @@ class SplitWindow(QMainWindow):
             for chunk in document.chunks:
                 try:
                     chunk_text = prepare_chunk_text_for_run(chunk.text, document.raw_text)
-                    rewritten, _, _ = transpile_qasm(chunk_text)
+                    rewritten, _, _ = transpile_for_split(chunk_text)
                 except Exception as exc:
                     rewritten = f"[ERROR: {exc}]"
                 result.append((f"Chunk {chunk.index}", chunk.text, rewritten))
@@ -537,7 +556,8 @@ class SplitWindow(QMainWindow):
         result: list[tuple[str, str, str]] = []
         for i, chunk_text in enumerate(chunks, 1):
             try:
-                rewritten, _, _ = transpile_qasm(chunk_text)
+                chunk_for_run = prepare_chunk_text_for_run(chunk_text, original_text)
+                rewritten, _, _ = transpile_for_split(chunk_for_run)
             except Exception as exc:
                 rewritten = f"[ERROR: {exc}]"
 
@@ -559,7 +579,7 @@ class SplitWindow(QMainWindow):
                 rewritten = ""
                 if chunks:
                     try:
-                        rewritten, _, _ = transpile_qasm(document.raw_text)
+                        rewritten, _, _ = transpile_for_split(document.raw_text)
                     except Exception as exc:
                         rewritten = f"[ERROR: {exc}]"
                 apply_gray_include_format(self.rewritten_chunk_view, rewritten)
@@ -575,7 +595,7 @@ class SplitWindow(QMainWindow):
                 tab.setFont(QFont("DejaVu Sans Mono", self.font_size))
                 try:
                     chunk_text = prepare_chunk_text_for_run(chunk.text, document.raw_text)
-                    rewritten, _, _ = transpile_qasm(chunk_text)
+                    rewritten, _, _ = transpile_for_split(chunk_text)
                 except Exception as exc:
                     rewritten = f"[ERROR: {exc}]"
                 apply_gray_include_format(tab, rewritten)

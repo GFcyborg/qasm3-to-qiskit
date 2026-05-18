@@ -1,6 +1,6 @@
 // from: https://en.wikipedia.org/wiki/Deutsch%E2%80%93Jozsa_algorithm
 
-OPENQASM 3.1;
+OPENQASM 3.0;
 include "stdgates.inc";
 
 // 4 qubit: q[0]=q0, q[1]=q1, q[2]=q2, q[3]=ancilla/target

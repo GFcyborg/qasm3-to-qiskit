@@ -1,6 +1,6 @@
 // from: https://www.youtube.com/watch?v=MvX5OUK-tbE&t=53
 
-OPENQASM 3.1;
+OPENQASM 3.0;
 include "stdgates.inc";
 
 qubit[6] q;

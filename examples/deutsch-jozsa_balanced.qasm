@@ -1,6 +1,6 @@
 //from: https://claude.ai/chat/e92cbef2-3162-4296-ab27-6b8fadd88af7
 
-OPENQASM 3.1;
+OPENQASM 3.0;
 include "stdgates.inc";
 
 // ── Registri ──────────────────────────────────────────────────────────────

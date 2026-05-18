@@ -26,6 +26,7 @@ class Issue:
     end: int
     kind: str
     detail: str
+    token: str | None = None
 
 
 def kind(node: Any) -> str:
@@ -54,13 +55,13 @@ def eval_text(expr: str, env: dict[str, Any]) -> Any | None:
         return None
 
 
-def append_issue(issues: list[Issue], node: Any, kind_name: str, detail: str) -> None:
+def append_issue(issues: list[Issue], node: Any, kind_name: str, detail: str, token: str | None = None) -> None:
     s = span(node)
     if s is None:
         start, end = 0, 0
     else:
         start, end = int(getattr(s, "start_line", 0)), int(getattr(s, "end_line", 0))
-    issues.append(Issue(start, end, kind_name, detail))
+    issues.append(Issue(start, end, kind_name, detail, token))
 
 
 def subst_env(text: str, env: dict[str, Any]) -> str:
@@ -530,17 +531,17 @@ def inline_subroutine_call(
 ) -> list[str] | None:
     MAX_INLINE_DEPTH = 6
     if inline_depth >= MAX_INLINE_DEPTH:
-        append_issue(issues, call, "functioncall", f"cannot inline subroutine (depth>{MAX_INLINE_DEPTH})")
+        append_issue(issues, call, "functioncall", f"cannot inline subroutine (depth>{MAX_INLINE_DEPTH})", token=getattr(getattr(call, "name", None), "name", None))
         return None
 
     if not subroutine_is_inlineable(subroutine):
-        append_issue(issues, call, "functioncall", "cannot inline subroutine (body uses unsupported classical flow)")
+        append_issue(issues, call, "functioncall", "cannot inline subroutine (body uses unsupported classical flow)", token=getattr(getattr(call, "name", None), "name", None))
         return None
 
     param_names = subroutine_param_names(subroutine)
     call_args = getattr(call, "arguments", []) or []
     if len(param_names) != len(call_args):
-        append_issue(issues, call, "functioncall", "cannot inline subroutine (argument count mismatch)")
+        append_issue(issues, call, "functioncall", "cannot inline subroutine (argument count mismatch)", token=getattr(getattr(call, "name", None), "name", None))
         return None
 
     arg_texts: dict[str, str] = {}
@@ -548,8 +549,7 @@ def inline_subroutine_call(
         try:
             arg_texts[name] = dumps(arg).strip().rstrip(";")
         except Exception:
-            append_issue(issues, call, "functioncall", "cannot inline subroutine (cannot serialize argument)")
-            return None
+            append_issue(issues, call, "functioncall", "cannot inline subroutine (cannot serialize argument)", token=getattr(getattr(call, "name", None), "name", None))
 
     local_renames: dict[str, str] = {}
     call_name = getattr(getattr(call, "name", None), "name", "sub")
@@ -619,7 +619,7 @@ def emit_stmt(
         if value is not None:
             env[name] = value
             return []
-        append_issue(issues, stmt, k.lower(), f"cannot fold constant {name}")
+        append_issue(issues, stmt, k.lower(), f"cannot fold constant {name}", token=name)
         return []
     if k == "ClassicalDeclaration":
         if is_supported_decl(stmt):
@@ -629,7 +629,7 @@ def emit_stmt(
         if value is not None:
             env[name] = value
             return []
-        append_issue(issues, stmt, k.lower(), f"drop unsupported declaration {name}")
+        append_issue(issues, stmt, k.lower(), f"drop unsupported declaration {name}", token=name)
         return []
     if k == "ClassicalAssignment":
         lvalue = getattr(stmt, "lvalue", None)
@@ -702,7 +702,7 @@ def emit_stmt(
                     )
                     if inlined is not None:
                         return inlined
-            append_issue(issues, stmt, k.lower(), "drop subroutine call assignment (cannot inline)")
+            append_issue(issues, stmt, k.lower(), "drop subroutine call assignment (cannot inline)", token=getattr(getattr(lvalue, "name", None), "name", None) if lvalue_kind == "Identifier" else None)
             return []
 
         try:
@@ -713,12 +713,12 @@ def emit_stmt(
     if k == "ForInLoop":
         values = range_values(getattr(stmt, "set_declaration", None), env)
         if values is None:
-            append_issue(issues, stmt, k.lower(), "loop range is not statically known")
+            append_issue(issues, stmt, k.lower(), "loop range is not statically known", token=getattr(getattr(stmt, "identifier", None), "name", None))
             return []
         MAX_UNROLL = 256
         if len(values) > MAX_UNROLL:
-            append_issue(issues, stmt, k.lower(), f"loop range too large to unroll ({len(values)} > {MAX_UNROLL})")
-            return []
+                append_issue(issues, stmt, k.lower(), f"loop range too large to unroll ({len(values)} > {MAX_UNROLL})", token=getattr(getattr(stmt, "identifier", None), "name", None))
+        return []
         out: list[str] = []
         ident = getattr(getattr(stmt, "identifier", None), "name", "")
         for value in values:
@@ -737,7 +737,12 @@ def emit_stmt(
             return out
         cond_text = rewrite_condition_text(getattr(stmt, "condition", None), env)
         if cond_text is None:
-            append_issue(issues, stmt, k.lower(), "condition cannot be rewritten for qiskit")
+            try:
+                cond = getattr(stmt, "condition", None)
+                cond_text = dumps(cond).strip() if cond is not None else None
+            except Exception:
+                cond_text = None
+            append_issue(issues, stmt, k.lower(), "condition cannot be rewritten for qiskit", token=cond_text)
             return []
         cond_text = subst_env(cond_text, env)
         out = [pad + f"if ({cond_text}) {{"]
@@ -813,8 +818,8 @@ def emit_stmt(
         name = getattr(getattr(stmt, "name", None), "name", "")
         rename_to = gate_renames.get(name) if gate_renames else None
         if rename_to:
-            append_issue(issues, stmt, "quantumgatedefinition", f"rename colliding gate {name} -> {rename_to} to avoid stdgates.inc collision")
-            name = rename_to
+                append_issue(issues, stmt, "quantumgatedefinition", f"rename colliding gate {name} -> {rename_to} to avoid stdgates.inc collision", token=name)
+        name = rename_to
         params: list[str] = []
         for arg in getattr(stmt, "arguments", []) or []:
             if kind(arg) == "Identifier":

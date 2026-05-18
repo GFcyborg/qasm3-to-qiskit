@@ -60,7 +60,7 @@ from qasm_rewriter import (
     inline_subroutine_call, extract_qasm_version, subst_env, substitute_names,
     inline_call_assignment_if_pattern, logical_meas_call_pattern,
     majority_vote_pairs_from_subroutine, node_iter, range_values,
-    stdgates_compat_lines, subroutine_is_inlineable, subroutine_param_names, kind,
+    renamed_gate_name, stdgates_compat_lines, subroutine_is_inlineable, subroutine_param_names, kind,
 )
 from dqc_container import parse_dqc_text, prepare_chunk_text_for_run
 from qiskit import transpile
@@ -317,6 +317,272 @@ def format_version_status(package_name: str, current_version: str) -> str:
     return f"{package_name}: {current_version} → {latest} (update available)"
 
 
+def minimal_transpile(source: str) -> tuple[str, list[Issue], Any | None]:
+    """Perform only minimal rewrites required for AER interoperability.
+
+    - Ensure an OPENQASM header exists for 3.0 sources.
+    - Ensure stdgates are included for 3.0 sources.
+    - Normalize hardware identifiers like `$0` into a declared qubit register.
+    - Rename custom gates that collide with stdgates using the `my_` prefix.
+    - Normalize `uint` tokens to `int`.
+    Returns (rewritten_text, issues, parsed_program).
+    """
+    version = extract_qasm_version(source)
+    if version == "3.1":
+        try:
+            program = parse(source)
+        except Exception:
+            program = None
+        return source, [], program
+
+    program_original: Any | None
+    try:
+        program_original = parse(source)
+    except Exception:
+        program_original = None
+
+    text = source
+    has_header = bool(re.search(r"(?mi)^[ \t]*OPENQASM\b", text))
+    has_stdgates_include = bool(re.search(r'(?mi)^\s*include\s+"stdgates\.inc"\s*;', text))
+
+    if not has_header:
+        text = "OPENQASM 3.0;\n" + text
+
+    if not has_stdgates_include:
+        lines = text.splitlines()
+        insert_at = 1 if lines and lines[0].strip().upper().startswith("OPENQASM") else 0
+        lines.insert(insert_at, 'include "stdgates.inc";')
+        text = "\n".join(lines)
+
+    stdgates_names: list[str] = []
+    for defline in stdgates_compat_lines():
+        match = re.match(r"^gate\s+([A-Za-z_]\w*)", defline)
+        if match:
+            stdgates_names.append(match.group(1))
+
+    # Normalize hardware $n identifiers into a declared qubit register
+    hw_matches = re.findall(r"\$([0-9]+)", text)
+    if hw_matches:
+        hw_indices = [int(x) for x in hw_matches]
+        max_hw = max(hw_indices)
+        hw_name = "hw"
+        while re.search(rf"\b{re.escape(hw_name)}\b", text):
+            hw_name += "_"
+        hw_decl = f"qubit[{max_hw + 1}] {hw_name};"
+        text = re.sub(r"\$([0-9]+)", lambda m: f"{hw_name}[{int(m.group(1))}]", text)
+        out_lines = text.splitlines()
+        insert_at = 0
+        if out_lines and out_lines[0].strip().upper().startswith("OPENQASM"):
+            insert_at = 1
+        out_lines.insert(insert_at, hw_decl)
+        text = "\n".join(out_lines)
+
+    try:
+        program = parse(text)
+    except Exception:
+        program = program_original
+
+    issues: list[Issue] = []
+
+    user_defined: set[str] = set()
+    if program is not None:
+        try:
+            for stmt in getattr(program, "statements", []):
+                if kind(stmt) == "QuantumGateDefinition":
+                    name_obj = getattr(stmt, "name", None) or getattr(stmt, "identifier", None)
+                    name = getattr(name_obj, "name", None)
+                    if name:
+                        user_defined.add(name)
+                for node in node_iter(stmt):
+                    if kind(node) == "QuantumGateDefinition":
+                        name = getattr(getattr(node, "identifier", None), "name", None)
+                        if name:
+                            user_defined.add(name)
+        except Exception:
+            user_defined = set()
+
+    gate_renames: dict[str, str] = {}
+    taken_gate_names = set(user_defined) | set(stdgates_names)
+    for name in sorted(user_defined):
+        if name in stdgates_names:
+            renamed = renamed_gate_name(name, taken_gate_names)
+            gate_renames[name] = renamed
+            taken_gate_names.add(renamed)
+
+    if gate_renames:
+        # Record issues for renamed gate definitions/usages using original program
+        span_program = program_original if program_original is not None else program
+        if span_program is not None:
+            for node in node_iter(span_program):
+                k = kind(node)
+                if k == "QuantumGateDefinition":
+                    name = getattr(getattr(node, "name", None), "name", "")
+                    if name in gate_renames:
+                        append_issue(issues, node, "quantumgatedefinition", f"rename colliding gate {name} -> {gate_renames[name]} to avoid stdgates.inc collision", token=name)
+                if k == "QuantumGate":
+                    # Try to extract invoked gate name from common attributes
+                    invoked = getattr(getattr(node, "name", None), "name", None) or getattr(getattr(node, "identifier", None), "name", None)
+                    if invoked and invoked in gate_renames:
+                        append_issue(issues, node, "quantumgate", f"rename gate usage {invoked} -> {gate_renames[invoked]} to avoid stdgates.inc collision", token=invoked)
+
+        text = substitute_names(text, gate_renames)
+        try:
+            program = parse(text)
+        except Exception:
+            pass
+
+    def _emit_minimal_stmt(stmt: Any, env: dict[str, Any], indent: int = 0) -> list[str]:
+        pad = "  " * indent
+        stmt_kind = kind(stmt)
+
+        if stmt_kind == "Include":
+            return [pad + dumps(stmt).strip()]
+
+        if stmt_kind in {"ConstantDeclaration", "ClassicalDeclaration"}:
+            name = getattr(getattr(stmt, "identifier", None), "name", "")
+            init_expr = getattr(stmt, "init_expression", None)
+            value = eval_node(init_expr, env) if init_expr is not None else None
+            if value is not None and name:
+                env[name] = value
+                append_issue(issues, stmt, "constantdeclaration", f"Folded away during rewrite because constant {name} is resolved at compile time.", token=name)
+                return []
+            if stmt_kind == "ConstantDeclaration":
+                append_issue(issues, stmt, "constantdeclaration", f"Dropped constant {name} (cannot fold)", token=name)
+                return []
+            if is_supported_decl(stmt):
+                try:
+                    return [pad + dumps(stmt).strip()]
+                except Exception:
+                    return [pad + dumps(stmt).strip()]
+            append_issue(issues, stmt, "classicaldeclaration", f"Drop unsupported declaration {name}", token=name)
+            return []
+
+        if stmt_kind == "ClassicalAssignment":
+            lvalue = getattr(stmt, "lvalue", None)
+            rvalue = getattr(stmt, "rvalue", None)
+            if kind(lvalue) == "Identifier":
+                name = getattr(lvalue, "name", "")
+                rhs_value = eval_node(rvalue, env)
+                if name and rhs_value is not None:
+                    env[name] = rhs_value
+                    append_issue(issues, stmt, "classicalassignment", f"Folded assignment for {name} into environment", token=name)
+                    return []
+            try:
+                return [pad + dumps(stmt).strip()]
+            except Exception:
+                return [pad + dumps(stmt).strip()]
+
+        if stmt_kind == "ForInLoop":
+            values = range_values(getattr(stmt, "set_declaration", None), env)
+            loop_name = getattr(getattr(stmt, "identifier", None), "name", "")
+            if values is None:
+                append_issue(issues, stmt, "forinloop", "Loop cannot be unrolled because range bounds are not statically known.", token=loop_name or None)
+                return []
+            out: list[str] = []
+            loop_name = getattr(getattr(stmt, "identifier", None), "name", "")
+            for value in values:
+                next_env = dict(env)
+                if loop_name:
+                    next_env[loop_name] = value
+                for inner in getattr(stmt, "block", []) or []:
+                    inner_lines = _emit_minimal_stmt(inner, next_env, indent)
+                    if loop_name:
+                        inner_lines = [substitute_names(line, {loop_name: str(value)}) for line in inner_lines]
+                    out.extend(inner_lines)
+            return out
+
+        if stmt_kind == "BranchingStatement":
+            cond_value = eval_node(getattr(stmt, "condition", None), env)
+            if isinstance(cond_value, bool):
+                block_name = "if_block" if cond_value else "else_block"
+                out: list[str] = []
+                for inner in getattr(stmt, block_name, []) or []:
+                    out.extend(_emit_minimal_stmt(inner, dict(env), indent))
+                try:
+                    cond = getattr(stmt, "condition", None)
+                    cond_text = dumps(cond).strip() if cond is not None else None
+                except Exception:
+                    cond_text = None
+                append_issue(issues, stmt, "branchingstatement", "Folded branch because condition is statically known", token=cond_text)
+                return out
+            try:
+                return [pad + dumps(stmt).strip()]
+            except Exception:
+                return [pad + dumps(stmt).strip()]
+
+        if stmt_kind == "Box":
+            out: list[str] = []
+            for inner in getattr(stmt, "body", []) or []:
+                out.extend(_emit_minimal_stmt(inner, dict(env), indent))
+            append_issue(issues, stmt, "box", "Unboxed during rewrite; only inner statements are kept.")
+            return out
+
+        try:
+            text_line = dumps(stmt).strip()
+        except Exception:
+            text_line = dumps(stmt).strip()
+        if gate_renames:
+            text_line = substitute_names(text_line, gate_renames)
+        return [pad + text_line]
+
+    if program is not None:
+        emitted_lines: list[str] = []
+        try:
+            emitted_env: dict[str, Any] = {}
+            for stmt in getattr(program, "statements", []):
+                emitted_lines.extend(_emit_minimal_stmt(stmt, emitted_env, 0))
+            if emitted_lines:
+                text = "\n".join(emitted_lines)
+        except Exception:
+            pass
+
+    # Emitting individual statements drops the program version line; restore it.
+    if not re.search(r"(?mi)^[ \t]*OPENQASM\b", text):
+        text = "OPENQASM 3.0;\n" + text
+
+    def _rewrite_simple_if_guard(line: str) -> str:
+        stripped = line.lstrip()
+        if not stripped.startswith("if"):
+            return line
+        if "==1" not in line and "== 1" not in line and "==0" not in line and "== 0" not in line:
+            return line
+        line = re.sub(r"==\s*1\b", "==true", line)
+        line = re.sub(r"==\s*0\b", "==false", line)
+        return line
+
+    # Record issues for any branching statements where we will rewrite numeric
+    # comparisons (==1/==0) into boolean comparisons so the editor can highlight them.
+    if program is not None:
+        for node in node_iter(program):
+            if kind(node) == "BranchingStatement":
+                cond = getattr(node, "condition", None)
+                try:
+                    cond_text = dumps(cond).strip() if cond is not None else ""
+                except Exception:
+                    cond_text = ""
+                m = re.search(r"==\s*1\b|==\s*0\b", cond_text)
+                if m:
+                    token = m.group(0)
+                    replacement = "==true" if "1" in token else "==false"
+                    append_issue(issues, node, "branchingcondition", f"rewrite condition '{token}' -> '{replacement}'", token=token)
+
+    text = "\n".join(_rewrite_simple_if_guard(line) for line in text.splitlines())
+
+    # Minimal post-processing
+    text = re.sub(r"\buint\b", "int", text)
+
+    # Try to parse rewritten text; fall back gracefully
+    try:
+        program = program_original if program_original is not None else parse(text)
+    except Exception:
+        try:
+            program = parse(text)
+        except Exception:
+            program = None
+
+    return text, issues, program
+
+
 
 
 
@@ -411,6 +677,9 @@ def mark_includes(program: Any, editor: QPlainTextEdit) -> list[tuple[int, int, 
         name = kind(node)
         if name == "Include":
             filename = getattr(node, "filename", "")
+            # Do not gray out stdgates.inc itself anymore (we no longer unfold it)
+            if Path(filename).name == "stdgates.inc":
+                return
             off = span_offsets(editor, node)
             if off:
                 spans.append((off[0], off[1], f"include:{filename}"))
@@ -426,6 +695,60 @@ def mark_rewrite_issues(issues: list[Issue], editor: QPlainTextEdit) -> list[tup
     for issue in issues:
         if issue.start <= 0 or issue.end <= 0:
             continue
+
+        def add_span_for_token(token_text: str) -> bool:
+            if not token_text:
+                return False
+            for ln in range(issue.start, issue.end + 1):
+                if ln <= 0:
+                    continue
+                blk = editor.document().findBlockByNumber(ln - 1)
+                txt = blk.text()
+                idxm = txt.find(token_text)
+                if idxm != -1:
+                    start = to_pos(editor, ln - 1, idxm)
+                    end = clamp_cursor_pos(editor, to_pos(editor, ln - 1, idxm + len(token_text)))
+                    if end >= start:
+                        spans.append((start, end, issue.detail))
+                        return True
+            return False
+
+        # Prefer an explicit token provided by the issue producer
+        if getattr(issue, "token", None):
+            if add_span_for_token(issue.token):
+                continue
+
+        # Try to extract a token for renames from the detail text
+        if "rename" in issue.detail.lower():
+            try:
+                m = re.search(r"rename.*?([A-Za-z_][\w\+\-]*)\s*->", issue.detail, re.IGNORECASE)
+                name_candidate = m.group(1) if m else None
+                if not name_candidate:
+                    arrow = issue.detail.find("->")
+                    if arrow != -1:
+                        left = issue.detail[:arrow].strip()
+                        parts = re.findall(r"[A-Za-z_][\w\+\-]*", left)
+                        if parts:
+                            name_candidate = parts[-1]
+                if name_candidate and add_span_for_token(name_candidate):
+                    continue
+            except Exception:
+                pass
+
+        # Try to extract a comparison token for condition rewrites
+        if "rewrite condition" in issue.detail.lower():
+            try:
+                m = re.search(r"rewrite condition\s*'([^']+)'", issue.detail, re.IGNORECASE)
+                token = m.group(1) if m else None
+                if not token:
+                    m2 = re.search(r"(==\s*1\b|==\s*0\b)", issue.detail)
+                    token = m2.group(1) if m2 else None
+                if token and add_span_for_token(token):
+                    continue
+            except Exception:
+                pass
+
+        # Fallback: cover the whole reported span
         start = to_pos(editor, issue.start - 1, 0)
         end = clamp_cursor_pos(editor, to_pos(editor, issue.end - 1, 999999))
         if end >= start:
@@ -962,19 +1285,22 @@ class MainWindow(QMainWindow):
         self._search_dialog: SearchDialog | None = None
         self.current_program: Any | None = None
         self.font_size = 10
+        self._output_user_override = False
+        self._setting_output_text = False
         # Number of shots to use for Qiskit/Aer runs (user-configurable)
         self.shots = 1024
         self._aer_timeout_seconds = 30
 
         self.editor = CodeEditor()
-        self.editor.textChanged.connect(self.debounced_refresh)
+        self.editor.textChanged.connect(self.on_editor_changed)
         self.editor.cursorPositionChanged.connect(self.sync_tree_from_cursor)
         self.tree = QTreeWidget()
         self.tree.setHeaderHidden(True)
         self.tree.itemSelectionChanged.connect(self.sync_editor_from_tree)
         self.output = QPlainTextEdit()
         self.output.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-        self.output.setReadOnly(True)
+        self.output.setReadOnly(False)
+        self.output.textChanged.connect(self.on_output_changed)
         self.circuit = CircuitView()
         self.circuit_info = QPlainTextEdit()
         self.circuit_info.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
@@ -1208,6 +1534,7 @@ class MainWindow(QMainWindow):
     def load_source(self, source_text: str, title: str | None = None) -> None:
         self._syncing = True
         try:
+            self._output_user_override = False
             self.editor.setPlainText(source_text)
             self.editor.set_issue_spans([])
             self.editor.set_include_spans([])
@@ -1227,10 +1554,24 @@ class MainWindow(QMainWindow):
         if not self._syncing:
             self._timer.start()
 
+    def on_editor_changed(self) -> None:
+        if self._syncing:
+            return
+        # Editing original QASM switches back to auto-generated rewritten text.
+        self._output_user_override = False
+        self.debounced_refresh()
+
+    def on_output_changed(self) -> None:
+        if self._syncing or self._setting_output_text:
+            return
+        # User-edited rewritten text becomes the active runtime input.
+        self._output_user_override = True
+        self.debounced_refresh()
+
     def refresh_views(self) -> None:
         source = self.editor.toPlainText()
         try:
-            rewritten, issues, program = transpile_qasm(source)
+            rewritten_auto, issues, program = minimal_transpile(source)
         except Exception as exc:
             self.current_program = None
             self.tree.clear()
@@ -1239,6 +1580,11 @@ class MainWindow(QMainWindow):
             self.editor.set_issue_spans([])
             self.set_importer_output(None, f"Parse error: {exc}", issues=[])
             return
+
+        if self._output_user_override:
+            rewritten = self.output.toPlainText()
+        else:
+            rewritten = rewritten_auto
         self.current_program = program
         qiskit_error = ""
         circuit = None
@@ -1246,7 +1592,12 @@ class MainWindow(QMainWindow):
             circuit = qiskit_parse(rewritten)
         except Exception as exc:
             qiskit_error = str(exc)
-        self.set_importer_output(rewritten, qiskit_error, circuit is not None, issues)
+        if self._output_user_override:
+            mode = "manual rewrite"
+            status = "OK" if circuit is not None else "ERROR"
+            self.output_title.setText(f"Qiskit importer ({mode}: {status})")
+        else:
+            self.set_importer_output(rewritten, qiskit_error, circuit is not None, issues)
         self.tree.clear()
         if program is not None:
             self.tree.addTopLevelItem(make_tree(program))
@@ -1270,44 +1621,55 @@ class MainWindow(QMainWindow):
             self.circuit_info.clear()
 
     def set_importer_output(self, rewritten: str | None, error: str = "", success: bool = True, issues: list[Issue] | None = None) -> None:
-        self.output.clear()
-        cursor = self.output.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.Start)
-        
-        if rewritten is None:
-            self.output.setPlainText(error)
-            self.output_title.setText(f"Qiskit importer (rewriting: ERROR)")
-            return
-        
-        red_format = QTextCharFormat()
-        red_format.setForeground(QColor("#cc0000"))
-        
-        include_format = QTextCharFormat()
-        include_format.setForeground(QColor("#303030"))
-        include_format.setBackground(QColor("#e0e0e0"))
-        
-        default_format = QTextCharFormat()
-        
-        if issues:
-            cursor.insertText("Unsupported / rewritten constructs:\n", red_format)
-            for issue in issues:
-                text = f"- {issue.kind}: {issue.detail} at lines {issue.start}-{issue.end}\n"
-                cursor.insertText(text, red_format)
-            cursor.insertText("\n", default_format)
-        
-        # Get the set of standard gate lines for comparison
-        stdgates_lines = set(line.strip() for line in stdgates_compat_lines())
-        
-        # Insert each line, using dark-gray format for expanded includes
-        lines = rewritten.rstrip().split("\n")
-        for i, line in enumerate(lines):
-            stripped = line.strip()
-            is_include_line = stripped in stdgates_lines
-            fmt = include_format if is_include_line else default_format
-            cursor.insertText(line + ("\n" if i < len(lines) - 1 else ""), fmt)
-        
-        status = "OK" if success else "ERROR"
-        self.output_title.setText(f"Qiskit importer (rewriting: {status})")
+        self._setting_output_text = True
+        try:
+            self.output.clear()
+            cursor = self.output.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.Start)
+
+            if rewritten is None:
+                self.output.setPlainText(error)
+                self.output_title.setText(f"Qiskit importer (rewriting: ERROR)")
+                return
+
+            red_format = QTextCharFormat()
+            red_format.setForeground(QColor("#cc0000"))
+
+            include_format = QTextCharFormat()
+            include_format.setForeground(QColor("#303030"))
+            include_format.setBackground(QColor("#e0e0e0"))
+
+            default_format = QTextCharFormat()
+
+            if issues:
+                cursor.insertText("Unsupported / rewritten constructs:\n", red_format)
+                for issue in issues:
+                    text = f"- {issue.kind}: {issue.detail} at lines {issue.start}-{issue.end}\n"
+                    cursor.insertText(text, red_format)
+                cursor.insertText("\n", default_format)
+
+            # Get the set of standard gate lines for comparison
+            stdgates_lines = set(line.strip() for line in stdgates_compat_lines())
+
+            # Insert each line, using dark-gray format for expanded includes
+            lines = rewritten.rstrip().split("\n")
+            for i, line in enumerate(lines):
+                stripped = line.strip()
+                is_include_line = stripped in stdgates_lines
+                fmt = include_format if is_include_line else default_format
+                cursor.insertText(line + ("\n" if i < len(lines) - 1 else ""), fmt)
+
+            status = "OK" if success else "ERROR"
+            self.output_title.setText(f"Qiskit importer (rewriting: {status})")
+        finally:
+            self._setting_output_text = False
+
+    def _set_output_text_programmatic(self, text: str) -> None:
+        self._setting_output_text = True
+        try:
+            self.output.setPlainText(text)
+        finally:
+            self._setting_output_text = False
 
     def _build_circuit_info_lines(self, circuit: Any, run_counts: Any | None = None, run_error: str | None = None, run_timestamp: datetime | None = None, run_status: str | None = None, run_duration: float | None = None) -> list[str]:
         lines = [
@@ -1500,6 +1862,51 @@ class MainWindow(QMainWindow):
                     process.terminate()
             except Exception:
                 pass
+
+        # Try to extract common identifier tokens from other issue messages
+        # (constants, folded assignments, dropped declarations) so we can
+        # highlight only the affected name instead of the whole statement.
+        try:
+            name_candidate = None
+            # common patterns that include an identifier
+            m = re.search(r"constant\s+([A-Za-z_]\w*)", issue.detail, re.IGNORECASE)
+            if m:
+                name_candidate = m.group(1)
+            if not name_candidate:
+                m = re.search(r"Folded assignment for\s+([A-Za-z_]\w*)", issue.detail, re.IGNORECASE)
+                if m:
+                    name_candidate = m.group(1)
+            if not name_candidate:
+                m = re.search(r"assignment for\s+([A-Za-z_]\w*)", issue.detail, re.IGNORECASE)
+                if m:
+                    name_candidate = m.group(1)
+            if not name_candidate:
+                m = re.search(r"drop unsupported declaration\s+([A-Za-z_]\w*)", issue.detail, re.IGNORECASE)
+                if m:
+                    name_candidate = m.group(1)
+            if not name_candidate:
+                m = re.search(r"dropped constant\s+([A-Za-z_]\w*)", issue.detail, re.IGNORECASE)
+                if m:
+                    name_candidate = m.group(1)
+
+            if name_candidate:
+                for ln in range(issue.start, issue.end + 1):
+                    if ln <= 0:
+                        continue
+                    blk = editor.document().findBlockByNumber(ln - 1)
+                    txt = blk.text()
+                    idxm = txt.find(name_candidate)
+                    if idxm != -1:
+                        start = to_pos(editor, ln - 1, idxm)
+                        end = clamp_cursor_pos(editor, to_pos(editor, ln - 1, idxm + len(name_candidate)))
+                        if end >= start:
+                            spans.append((start, end, issue.detail))
+                            break
+                else:
+                    # no match found, continue to default full-span behavior
+                    pass
+        except Exception:
+            pass
         for process in processes:
             try:
                 process.join(timeout=1)
@@ -1571,7 +1978,7 @@ class MainWindow(QMainWindow):
     def rewrite_current(self) -> None:
         source = self.editor.toPlainText()
         try:
-            rewritten, _, _ = transpile_qasm(source)
+            rewritten, _, _ = minimal_transpile(source)
         except Exception as exc:
             QMessageBox.critical(self, "Rewrite failed", str(exc))
             return
@@ -1602,7 +2009,10 @@ class MainWindow(QMainWindow):
         source = self.editor.toPlainText()
         circuit = None
         try:
-            rewritten, _, _ = transpile_qasm(source)
+            if self._output_user_override:
+                rewritten = self.output.toPlainText()
+            else:
+                rewritten, _, _ = minimal_transpile(source)
             circuit = qiskit_parse(rewritten)
             circuit = self.prompt_parameter_values(circuit)
             if circuit is None:
