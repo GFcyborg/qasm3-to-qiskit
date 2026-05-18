@@ -883,11 +883,25 @@ class SplitWindow(QMainWindow):
         # Prepare chunk texts and pass them to run.py via stdin as JSON
         if self.current_dqc_document is not None:
             document = parse_dqc_text(self.editor.toPlainText())
-            chunks = [(f"Chunk {chunk.index}", prepare_chunk_text_for_run(chunk.text, document.raw_text)) for chunk in document.chunks]
+            chunks: list[tuple[str,str]] = []
+            for chunk in document.chunks:
+                chunk_for_run = prepare_chunk_text_for_run(chunk.text, document.raw_text)
+                try:
+                    rewritten, _, _ = transpile_for_split(chunk_for_run)
+                except Exception:
+                    rewritten = chunk_for_run
+                chunks.append((f"Chunk {chunk.index}", rewritten))
         else:
             original_text = self.editor.toPlainText()
             piece_texts = self.extract_chunks_by_lines(original_text, set(self.editor.split_points))
-            chunks = [(f"Chunk {i}", prepare_chunk_text_for_run(text, original_text)) for i, text in enumerate(piece_texts, 1)]
+            chunks = []
+            for i, text in enumerate(piece_texts, 1):
+                chunk_for_run = prepare_chunk_text_for_run(text, original_text)
+                try:
+                    rewritten, _, _ = transpile_for_split(chunk_for_run)
+                except Exception:
+                    rewritten = chunk_for_run
+                chunks.append((f"Chunk {i}", rewritten))
 
         try:
             script = ROOT / "run.py"
