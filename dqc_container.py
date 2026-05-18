@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import re
 
+from qasm_rewriter import extract_qasm_version
+
 
 PRAGMA_RE = re.compile(
     r"^\s*pragma\s+dqc\.v(?P<version>[0-9]+)\.split\s+id\s*=\s*(?P<id>[1-9][0-9]*)\s*$",
@@ -24,6 +26,10 @@ class DqcDocument:
     pragma_line_numbers: set[int]
     display_to_raw_after_line: dict[int, int]
     raw_split_after_lines: set[int]
+
+
+OPENQASM_3_1_HEADER_RE = re.compile(r"(?im)^\s*OPENQASM\s+3\.1\b")
+STDGATES_INCLUDE_RE = re.compile(r'(?im)^\s*include\s+"stdgates\.inc"\s*;\s*$')
 
 
 def is_dqc_pragma_line(line: str) -> bool:
@@ -101,6 +107,27 @@ def render_dqc_text(raw_text: str, split_after_lines: set[int]) -> str:
 
 def strip_dqc_pragmas(text: str) -> str:
     return parse_dqc_text(text).raw_text
+
+
+def prepare_chunk_text_for_run(chunk_text: str, source_text: str) -> str:
+    """Preserve the original OPENQASM 3.1 header on split chunks.
+
+    This keeps chunk tabs and launched chunk runs aligned with the source file:
+    chunks derived from OPENQASM 3.1 stay in pass-through mode even after they
+    are split out of the original document.
+    """
+    if extract_qasm_version(source_text) != "3.1":
+        return chunk_text
+    if not chunk_text:
+        return chunk_text
+    prefix_parts: list[str] = []
+    if not OPENQASM_3_1_HEADER_RE.search(chunk_text):
+        prefix_parts.append("OPENQASM 3.1;")
+    if not STDGATES_INCLUDE_RE.search(chunk_text):
+        prefix_parts.append('include "stdgates.inc";')
+    if not prefix_parts:
+        return chunk_text
+    return "\n".join(prefix_parts) + "\n" + chunk_text
 
 
 def display_split_lines_to_raw_split_after_lines(document: DqcDocument, split_lines: set[int]) -> set[int]:

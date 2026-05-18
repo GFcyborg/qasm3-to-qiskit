@@ -62,7 +62,7 @@ from qasm_rewriter import (
     majority_vote_pairs_from_subroutine, node_iter, range_values,
     stdgates_compat_lines, subroutine_is_inlineable, subroutine_param_names, kind,
 )
-from dqc_container import parse_dqc_text
+from dqc_container import parse_dqc_text, prepare_chunk_text_for_run
 from qiskit import transpile
 from qiskit_aer import AerSimulator
 from qiskit_qasm3_import import parse as qiskit_parse
@@ -1842,7 +1842,10 @@ def main() -> int:
         path = Path(args.file)
         if path.exists() and path.suffix.lower() == ".dqc":
             document = parse_dqc_text(path.read_text())
-            chunk_texts = [(f"Chunk {chunk.index}", chunk.text) for chunk in document.chunks]
+            chunk_texts = [
+                (f"Chunk {chunk.index}", prepare_chunk_text_for_run(chunk.text, document.raw_text))
+                for chunk in document.chunks
+            ]
             window = ChunkTabsWindow(chunk_texts, f"QASM3 Aer Lab - {path.name}")
         else:
             window = MainWindow(file_to_load=args.file)

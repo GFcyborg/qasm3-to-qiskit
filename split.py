@@ -44,6 +44,7 @@ from dqc_container import (
     display_split_lines_to_raw_split_after_lines,
     is_dqc_pragma_line,
     parse_dqc_text,
+    prepare_chunk_text_for_run,
     render_dqc_text,
 )
 
@@ -53,6 +54,16 @@ EXAMPLES = ROOT / "examples"
 
 
 STDGATES_LINE_SET = {line.strip() for line in stdgates_compat_lines()}
+INNER_SCOPE_BLOCKING_KINDS = {
+    "QuantumGateDefinition",
+    "ForInLoop",
+    "WhileLoop",
+    "BranchingStatement",
+    "Box",
+    "SubroutineDefinition",
+    "CalibrationDefinition",
+    "CalibrationGrammarDeclaration",
+}
 
 
 def clear_directory_contents(path: Path) -> None:
@@ -108,6 +119,21 @@ def apply_gray_line_numbers(widget: QPlainTextEdit, line_numbers: set[int]) -> N
         cursor = QTextCursor(block)
         cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock, QTextCursor.MoveMode.KeepAnchor)
         cursor.setCharFormat(line_format)
+
+
+def line_is_inside_blocking_scope(program: Any, line: int) -> bool:
+    """Return True when a line falls inside an inner scope that should not split."""
+    for node in node_iter(program):
+        if kind(node) not in INNER_SCOPE_BLOCKING_KINDS:
+            continue
+        s = span(node)
+        if not s:
+            continue
+        start = int(getattr(s, "start_line", 0))
+        end = int(getattr(s, "end_line", 0))
+        if start <= line < end:
+            return True
+    return False
 
 
 @dataclass(slots=True)
@@ -475,29 +501,7 @@ class SplitWindow(QMainWindow):
                 return True
             line = document.display_to_raw_after_line.get(line, line)
 
-        # Kinds whose spans define inner scopes we should not split inside
-        blocking_kinds = {
-            "QuantumGateDefinition",
-            "ForInLoop",
-            "BranchingStatement",
-            "Box",
-            "SubroutineDefinition",
-            "CalibrationDefinition",
-            "CalibrationGrammarDeclaration",
-        }
-
-        for node in node_iter(self.current_program):
-            if kind(node) not in blocking_kinds:
-                continue
-            s = span(node)
-            if not s:
-                continue
-            start = int(getattr(s, "start_line", 0))
-            end = int(getattr(s, "end_line", 0))
-            # If the selected line is strictly inside the node span (not at its closing line), block it
-            if start <= line < end:
-                return False
-        return True
+        return not line_is_inside_blocking_scope(self.current_program, line)
 
     def flash_status(self, message: str, timeout_ms: int = 1800) -> None:
         """Temporarily show `message` in the status label, then restore previous text."""
@@ -520,7 +524,8 @@ class SplitWindow(QMainWindow):
             result: list[tuple[str, str, str]] = []
             for chunk in document.chunks:
                 try:
-                    rewritten, _, _ = transpile_qasm(chunk.text)
+                    chunk_text = prepare_chunk_text_for_run(chunk.text, document.raw_text)
+                    rewritten, _, _ = transpile_qasm(chunk_text)
                 except Exception as exc:
                     rewritten = f"[ERROR: {exc}]"
                 result.append((f"Chunk {chunk.index}", chunk.text, rewritten))
@@ -569,7 +574,8 @@ class SplitWindow(QMainWindow):
                 tab.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
                 tab.setFont(QFont("DejaVu Sans Mono", self.font_size))
                 try:
-                    rewritten, _, _ = transpile_qasm(chunk.text)
+                    chunk_text = prepare_chunk_text_for_run(chunk.text, document.raw_text)
+                    rewritten, _, _ = transpile_qasm(chunk_text)
                 except Exception as exc:
                     rewritten = f"[ERROR: {exc}]"
                 apply_gray_include_format(tab, rewritten)

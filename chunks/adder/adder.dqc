@@ -30,13 +30,13 @@ reset a;
 reset b;
 reset cout;
 
-pragma dqc.v1.split id=2
 // set input states
 for uint i in [0: 3] {
   if(bool(a_in[i])) x a[i];
   if(bool(b_in[i])) x b[i];
 }
 // add a to b, storing result in b
+pragma dqc.v1.split id=2
 majority cin[0], b[0], a[0];
 for uint i in [0: 2] { majority a[i], b[i + 1], a[i + 1]; }
 cx a[3], cout[0];
