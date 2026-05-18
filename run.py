@@ -696,10 +696,10 @@ def mark_rewrite_issues(issues: list[Issue], editor: QPlainTextEdit) -> list[tup
         if issue.start <= 0 or issue.end <= 0:
             continue
 
-        def add_span_for_token(token_text: str) -> bool:
+        def add_span_for_token(issue_obj: Issue, token_text: str | None) -> bool:
             if not token_text:
                 return False
-            for ln in range(issue.start, issue.end + 1):
+            for ln in range(issue_obj.start, issue_obj.end + 1):
                 if ln <= 0:
                     continue
                 blk = editor.document().findBlockByNumber(ln - 1)
@@ -709,13 +709,13 @@ def mark_rewrite_issues(issues: list[Issue], editor: QPlainTextEdit) -> list[tup
                     start = to_pos(editor, ln - 1, idxm)
                     end = clamp_cursor_pos(editor, to_pos(editor, ln - 1, idxm + len(token_text)))
                     if end >= start:
-                        spans.append((start, end, issue.detail))
+                        spans.append((start, end, issue_obj.detail))
                         return True
             return False
 
         # Prefer an explicit token provided by the issue producer
         if getattr(issue, "token", None):
-            if add_span_for_token(issue.token):
+            if add_span_for_token(issue, issue.token):
                 continue
 
         # Try to extract a token for renames from the detail text
@@ -730,7 +730,7 @@ def mark_rewrite_issues(issues: list[Issue], editor: QPlainTextEdit) -> list[tup
                         parts = re.findall(r"[A-Za-z_][\w\+\-]*", left)
                         if parts:
                             name_candidate = parts[-1]
-                if name_candidate and add_span_for_token(name_candidate):
+                if name_candidate and add_span_for_token(issue, name_candidate):
                     continue
             except Exception:
                 pass
@@ -743,7 +743,7 @@ def mark_rewrite_issues(issues: list[Issue], editor: QPlainTextEdit) -> list[tup
                 if not token:
                     m2 = re.search(r"(==\s*1\b|==\s*0\b)", issue.detail)
                     token = m2.group(1) if m2 else None
-                if token and add_span_for_token(token):
+                if token and add_span_for_token(issue, token):
                     continue
             except Exception:
                 pass
@@ -1863,50 +1863,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
-        # Try to extract common identifier tokens from other issue messages
-        # (constants, folded assignments, dropped declarations) so we can
-        # highlight only the affected name instead of the whole statement.
-        try:
-            name_candidate = None
-            # common patterns that include an identifier
-            m = re.search(r"constant\s+([A-Za-z_]\w*)", issue.detail, re.IGNORECASE)
-            if m:
-                name_candidate = m.group(1)
-            if not name_candidate:
-                m = re.search(r"Folded assignment for\s+([A-Za-z_]\w*)", issue.detail, re.IGNORECASE)
-                if m:
-                    name_candidate = m.group(1)
-            if not name_candidate:
-                m = re.search(r"assignment for\s+([A-Za-z_]\w*)", issue.detail, re.IGNORECASE)
-                if m:
-                    name_candidate = m.group(1)
-            if not name_candidate:
-                m = re.search(r"drop unsupported declaration\s+([A-Za-z_]\w*)", issue.detail, re.IGNORECASE)
-                if m:
-                    name_candidate = m.group(1)
-            if not name_candidate:
-                m = re.search(r"dropped constant\s+([A-Za-z_]\w*)", issue.detail, re.IGNORECASE)
-                if m:
-                    name_candidate = m.group(1)
-
-            if name_candidate:
-                for ln in range(issue.start, issue.end + 1):
-                    if ln <= 0:
-                        continue
-                    blk = editor.document().findBlockByNumber(ln - 1)
-                    txt = blk.text()
-                    idxm = txt.find(name_candidate)
-                    if idxm != -1:
-                        start = to_pos(editor, ln - 1, idxm)
-                        end = clamp_cursor_pos(editor, to_pos(editor, ln - 1, idxm + len(name_candidate)))
-                        if end >= start:
-                            spans.append((start, end, issue.detail))
-                            break
-                else:
-                    # no match found, continue to default full-span behavior
-                    pass
-        except Exception:
-            pass
+        # No per-issue highlighting required during executor shutdown.
         for process in processes:
             try:
                 process.join(timeout=1)
