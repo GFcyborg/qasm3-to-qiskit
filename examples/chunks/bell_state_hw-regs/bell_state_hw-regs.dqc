@@ -1,0 +1,7 @@
+OPENQASM 3.0;
+include "stdgates.inc";
+h $0;
+cx $0, $1;
+measure $0;
+pragma dqc.v1.split id=1
+measure $1;

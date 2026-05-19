@@ -68,6 +68,10 @@ from qiskit_qasm3_import import parse as qiskit_parse
 ROOT = Path(__file__).resolve().parent
 EXAMPLES = ROOT / "examples"
 
+# Map for anonymous wires to produce stable labels like 'bit0', 'bit1', ...
+_anon_wire_map: dict[str, str] = {}
+_anon_wire_counters: dict[str, int] = {}
+
 
 STDGATES_LINE_SET = {line.strip() for line in stdgates_compat_lines()}
 INNER_SCOPE_BLOCKING_KINDS = {
@@ -182,10 +186,71 @@ class ChunkFlow:
 
 
 def wire_label(wire: Any) -> str:
-    register = getattr(wire, "_register", None)
-    register_name = getattr(register, "name", "wire")
-    index = getattr(wire, "_index", 0)
-    return f"{register_name}[{index}]"
+    # Try common patterns used by Qiskit wire objects, but be robust when
+    # attributes are missing or None. Prefer compact varnames like `c0`.
+    register = getattr(wire, "_register", None) or getattr(wire, "register", None)
+    register_name = None
+    if register is not None:
+        register_name = getattr(register, "name", None)
+        if register_name is None and isinstance(register, (tuple, list)) and len(register) > 1:
+            # Qiskit sometimes exposes register as a tuple like (size, name)
+            register_name = register[1]
+
+    # Get index from common attribute names
+    index = getattr(wire, "_index", None)
+    if index is None:
+        index = getattr(wire, "index", None)
+
+    # If we have both register name and index, emit compact form like 'c0'
+    if register_name is not None and index is not None:
+        return f"{register_name}{index}"
+
+    # If only register name is available, return it
+    if register_name is not None:
+        return str(register_name)
+
+    # If the wire has a direct name attribute, use it
+    name = getattr(wire, "name", None)
+    if name:
+        return str(name)
+
+    # If we at least have an index, use a classname+index fallback (e.g., Clbit0)
+    if index is not None:
+        return f"{wire.__class__.__name__}{index}"
+
+    # Final fallback: try to parse useful info from the repr string and
+    # otherwise assign a stable anonymous label like 'bit0', 'bit1'.
+    rep = repr(wire)
+    import re
+
+    # Try to capture index-like fields in common reprs: 'index=0' or 'uid=0'
+    m = re.search(r"(?:index|uid)\s*=\s*(\d+)", rep)
+    idx = int(m.group(1)) if m else None
+    # Try to capture a register name inside quotes: (3, 'c') or (3, "c")
+    mreg = re.search(r"\(\s*\d+\s*,\s*['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]\s*\)", rep)
+    reg = mreg.group(1) if mreg else None
+
+    if reg is not None and idx is not None:
+        return f"{reg}{idx}"
+
+    # Use stable anonymous names when no var/register info is available.
+    typename = wire.__class__.__name__.lower()
+    # Map common classnames to the simpler 'bit' or 'qubit' labels
+    if 'clbit' in typename or 'cbit' in typename or 'classical' in typename:
+        anon_type = 'bit'
+    elif 'qubit' in typename or 'qbit' in typename or 'quantum' in typename:
+        anon_type = 'qubit'
+    else:
+        anon_type = typename
+
+    if rep in _anon_wire_map:
+        return _anon_wire_map[rep]
+
+    counter = _anon_wire_counters.get(anon_type, 0)
+    label = f"{anon_type}{counter}"
+    _anon_wire_counters[anon_type] = counter + 1
+    _anon_wire_map[rep] = label
+    return label
 
 
 def _identifier_name(node: Any) -> str:
@@ -1090,13 +1155,23 @@ class SplitWindow(QMainWindow):
 
         file_menu.addSeparator()
         
-        examples_menu = file_menu.addMenu("Examples")
+        examples_menu = file_menu.addMenu("QASM examples")
         for path in sorted(EXAMPLES.glob("*.qasm")):
             if "problematic" in str(path):
                 continue
             action = QAction(path.name, self)
             action.triggered.connect(lambda _=False, p=path: self.load_file(p))
             examples_menu.addAction(action)
+
+        # DQC chunks submenu: list .dqc files under examples/chunks/*/*.dqc
+        chunks_menu = file_menu.addMenu("DQC chunks")
+        chunks_root = EXAMPLES / "chunks"
+        if chunks_root.exists():
+            for path in sorted(chunks_root.glob("*/*.dqc")):
+                action = QAction(path.parent.name, self)
+                action.setToolTip(str(path))
+                action.triggered.connect(lambda _=False, p=path: self.load_dqc_file(p))
+                chunks_menu.addAction(action)
         
         file_menu.addSeparator()
         
