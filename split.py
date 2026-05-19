@@ -925,7 +925,9 @@ class CodeEditor(QPlainTextEdit):
         self.setReadOnly(True)
         self.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self.line_number_area = LineNumberArea(self)
-        self.split_points: set[int] = set()  # 1-indexed line numbers where splits occur
+        # 1-indexed line numbers marking the FIRST line of the next chunk.
+        # i.e. a split point at line `L` means "split BEFORE line L".
+        self.split_points: set[int] = set()
         self.blockCountChanged.connect(self.update_line_number_area_width)
         self.updateRequest.connect(self.update_line_number_area)
         self.update_line_number_area_width(0)
@@ -962,7 +964,7 @@ class CodeEditor(QPlainTextEdit):
             self.add_split_point(line)
 
     def add_split_point(self, line: int) -> None:
-        """Mark a split point at line (1-indexed, means split AFTER this line)."""
+        """Mark a split point at line (1-indexed). The split will occur BEFORE this line."""
         window = self.window()
         if isinstance(window, SplitWindow):
             window.on_split_point_added(line)
@@ -1267,28 +1269,38 @@ class SplitWindow(QMainWindow):
             self.status_label.setText("Load failed")
 
     def extract_chunks_by_lines(self, text: str, split_after_lines: set[int]) -> list[str]:
-        """Split text after specified 1-indexed lines."""
+        """Split text according to split points.
+
+        The `split_after_lines` parameter is interpreted as a set of 1-indexed
+        line numbers that mark the FIRST line of the next chunk (i.e. a split
+        BEFORE that line). This keeps `CodeEditor.split_points` as the user-facing
+        line that was right-clicked. Internally we convert these into the set of
+        lines *after* which a chunk should end.
+        """
         lines = text.splitlines(keepends=True)
         if not split_after_lines:
             return [text]
-        
+
+        # Convert "split before line L" into "split after line L-1" for the
+        # splitting algorithm. Ignore attempts to split before the first line.
+        split_after_converted = sorted({ln - 1 for ln in split_after_lines if ln > 1})
+
         chunks: list[str] = []
         current_chunk: list[str] = []
-        split_after_sorted = sorted(split_after_lines)
         split_idx = 0
-        
+
         for i, line in enumerate(lines):
             line_num = i + 1  # 1-indexed
             current_chunk.append(line)
-            
-            if split_idx < len(split_after_sorted) and line_num == split_after_sorted[split_idx]:
+
+            if split_idx < len(split_after_converted) and line_num == split_after_converted[split_idx]:
                 chunks.append("".join(current_chunk))
                 current_chunk = []
                 split_idx += 1
-        
+
         if current_chunk:
             chunks.append("".join(current_chunk))
-        
+
         return chunks
 
 
@@ -1523,7 +1535,9 @@ class SplitWindow(QMainWindow):
             split_after_lines = document.raw_split_after_lines
         else:
             raw_text = self.editor.toPlainText()
-            split_after_lines = set(self.editor.split_points)
+            # Convert display split points (split BEFORE line L) into raw
+            # split-after line numbers for rendering DQC pragmas.
+            split_after_lines = {ln - 1 for ln in self.editor.split_points if ln > 1}
 
         dqc_text = render_dqc_text(raw_text, split_after_lines)
         dqc_file = out_dir / f"{base_name}.dqc"
