@@ -2,7 +2,7 @@ from pathlib import Path
 import tempfile
 
 from dqc_container import parse_dqc_text, prepare_chunk_text_for_run, render_dqc_text
-from split import clear_directory_contents, line_is_inside_blocking_scope
+from split import clear_directory_contents, compute_chunk_flows, format_flow_lines_html, line_is_inside_blocking_scope
 from openqasm3 import parse
 
 
@@ -56,12 +56,52 @@ def test_prepare_chunk_text_for_run_leaves_existing_header_untouched():
 
 
 def test_line_is_inside_blocking_scope_catches_while_loops():
-    source_text = Path(__file__).resolve().parents[1] / "examples" / "qiskit-example_3.1.qasm"
+    source_text = Path(__file__).resolve().parents[1] / "examples" / "qiskit-example.qasm"
     source_text = source_text.read_text()
     program = parse(source_text)
 
     assert line_is_inside_blocking_scope(program, 38)
     assert line_is_inside_blocking_scope(program, 37)
     assert not line_is_inside_blocking_scope(program, 45)
+
+
+def test_format_flow_lines_html_bolds_qubit_names_only():
+    text = format_flow_lines_html({"q": {1, 3}, "c": {2}}, "<-", {"q"})
+
+    assert "<b>q</b> &lt;- Chunk 1, Chunk 3" in text
+    assert "c &lt;- Chunk 2" in text
+
+
+def test_compute_chunk_flows_uses_latest_write_before_rvalue_use():
+    source_text = "OPENQASM 3.0;\n"
+    chunks = [
+        "int[32] x = 0;\n",
+        "x = 1;\nint[32] y = x;\n",
+        "int[32] z = x;\n",
+    ]
+
+    flows = compute_chunk_flows(chunks, source_text)
+
+    assert flows[0].incoming_sources == {}
+    assert flows[0].outgoing_targets == {}
+    assert flows[1].incoming_sources == {}
+    assert flows[1].outgoing_targets == {"x": {3}}
+    assert flows[2].incoming_sources == {"x": {2}}
+
+
+def test_compute_chunk_flows_treats_qubit_targets_as_updates():
+    source_text = 'OPENQASM 3.0;\ninclude "stdgates.inc";\n'
+    chunks = [
+        "qubit[1] q;\n",
+        "h q[0];\n",
+        "h q[0];\n",
+    ]
+
+    flows = compute_chunk_flows(chunks, source_text)
+
+    assert flows[0].outgoing_targets == {"q": {2}}
+    assert flows[1].incoming_sources == {"q": {1}}
+    assert flows[1].outgoing_targets == {"q": {3}}
+    assert flows[2].incoming_sources == {"q": {2}}
 
 

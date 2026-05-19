@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sys
 import subprocess
+import html
 import json
 import shutil
 import math
@@ -27,6 +28,7 @@ from PySide6.QtWidgets import (
     QSplitter,
     QVBoxLayout,
     QPlainTextEdit,
+    QTextEdit,
     QLabel,
     QFileDialog,
     QMessageBox,
@@ -196,6 +198,32 @@ def _identifier_name(node: Any) -> str:
     return ""
 
 
+def _node_identifier_names(node: Any) -> set[str]:
+    names: set[str] = set()
+    if node is None:
+        return names
+    for nested in node_iter(node):
+        name = _identifier_name(nested)
+        if name:
+            names.add(name)
+    return names
+
+
+def _operand_identifier_names(node: Any) -> set[str]:
+    name = _identifier_name(node)
+    if name:
+        return {name}
+    return _node_identifier_names(node)
+
+
+def _as_iterable_nodes(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
 def _stmt_defined_names(stmt: Any) -> set[str]:
     kind_name = kind(stmt)
     if kind_name == "QubitDeclaration":
@@ -221,22 +249,80 @@ def _stmt_defined_names(stmt: Any) -> set[str]:
     return set()
 
 
-def _stmt_used_names(stmt: Any) -> set[str]:
+def _stmt_read_write_names(stmt: Any) -> tuple[set[str], set[str]]:
     kind_name = kind(stmt)
     if kind_name in {"QuantumGateDefinition", "SubroutineDefinition", "CalibrationDefinition"}:
-        return set()
+        return set(), set()
 
-    used: set[str] = set()
+    if kind_name == "ClassicalDeclaration":
+        name = getattr(getattr(stmt, "identifier", None), "name", "") or ""
+        reads = _operand_identifier_names(getattr(stmt, "init_expression", None))
+        writes = {name} if name else set()
+        return reads, writes
+
+    if kind_name == "IODeclaration":
+        name = getattr(getattr(stmt, "identifier", None), "name", "") or ""
+        return set(), ({name} if name else set())
+
+    if kind_name == "AliasStatement":
+        target = _identifier_name(getattr(stmt, "target", None))
+        reads = _operand_identifier_names(getattr(stmt, "value", None))
+        writes = {target} if target else set()
+        return reads, writes
+
+    if kind_name == "ClassicalAssignment":
+        reads = _operand_identifier_names(getattr(stmt, "rvalue", None))
+        writes = _operand_identifier_names(getattr(stmt, "lvalue", None))
+        return reads - writes, writes
+
+    if kind_name == "QuantumGate":
+        qubit_names: set[str] = set()
+        for qb in _as_iterable_nodes(getattr(stmt, "qubits", None)):
+            qubit_names |= _operand_identifier_names(qb)
+        reads = qubit_names.copy()
+        for arg in _as_iterable_nodes(getattr(stmt, "arguments", None)):
+            reads |= _operand_identifier_names(arg)
+        return reads, qubit_names
+
+    if kind_name == "QuantumMeasurementStatement":
+        measure = getattr(stmt, "measure", None)
+        qubit_names = _operand_identifier_names(getattr(measure, "qubit", None))
+        target_names = _operand_identifier_names(getattr(stmt, "target", None))
+        reads = qubit_names.copy()
+        writes = qubit_names | target_names
+        return reads, writes
+
+    if kind_name == "QuantumReset":
+        qubit_names: set[str] = set()
+        for qb in _as_iterable_nodes(getattr(stmt, "qubits", None)):
+            qubit_names |= _operand_identifier_names(qb)
+        return qubit_names.copy(), qubit_names
+
+    if kind_name == "BranchingStatement":
+        return _operand_identifier_names(getattr(stmt, "condition", None)), set()
+
+    if kind_name == "WhileLoop":
+        return _operand_identifier_names(getattr(stmt, "while_condition", None)), set()
+
+    if kind_name == "ForInLoop":
+        reads = _operand_identifier_names(getattr(stmt, "set_declaration", None))
+        writes = _operand_identifier_names(getattr(stmt, "identifier", None))
+        return reads - writes, writes
+
+    if kind_name == "Box":
+        return set(), set()
+
+    reads: set[str] = set()
     for node in node_iter(stmt):
         name = _identifier_name(node)
         if name:
-            used.add(name)
-    used -= _stmt_defined_names(stmt)
-    return used
+            reads.add(name)
+    writes = _stmt_defined_names(stmt)
+    return reads - writes, writes
 
 
 def analyze_chunk_flow(chunk_text: str, source_text: str) -> tuple[set[str], set[str]]:
-    """Return (defined_names, used_names) for a single chunk."""
+    """Return (written_names, read_names) for a single chunk."""
     prepared = prepare_chunk_text_for_run(chunk_text, source_text)
     try:
         program = parse(prepared)
@@ -246,49 +332,106 @@ def analyze_chunk_flow(chunk_text: str, source_text: str) -> tuple[set[str], set
     defined: set[str] = set()
     used: set[str] = set()
     for stmt in getattr(program, "statements", []):
-        defined |= _stmt_defined_names(stmt)
-        used |= _stmt_used_names(stmt)
+        stmt_used, stmt_defined = _stmt_read_write_names(stmt)
+        defined |= stmt_defined
+        used |= stmt_used
     return defined, used
+
+
+def _scan_statement_dependencies(
+    stmt: Any,
+    chunk_index: int,
+    current_writers: dict[str, int],
+    incoming_sources: dict[str, set[int]],
+    outgoing_targets: dict[int, dict[str, set[int]]],
+    defined: set[str],
+    used: set[str],
+) -> None:
+    kind_name = kind(stmt)
+    if kind_name in {"QuantumGateDefinition", "SubroutineDefinition", "CalibrationDefinition"}:
+        return
+
+    if kind_name == "BranchingStatement":
+        condition_used = _node_identifier_names(getattr(stmt, "condition", None))
+        used.update(condition_used)
+        for name in sorted(condition_used):
+            writer = current_writers.get(name)
+            if writer is not None and writer != chunk_index:
+                incoming_sources.setdefault(name, set()).add(writer)
+                outgoing_targets.setdefault(writer, {}).setdefault(name, set()).add(chunk_index)
+        for inner in getattr(stmt, "if_block", []) or []:
+            _scan_statement_dependencies(inner, chunk_index, current_writers, incoming_sources, outgoing_targets, defined, used)
+        for inner in getattr(stmt, "else_block", []) or []:
+            _scan_statement_dependencies(inner, chunk_index, current_writers, incoming_sources, outgoing_targets, defined, used)
+        return
+
+    if kind_name == "WhileLoop":
+        condition_used = _node_identifier_names(getattr(stmt, "while_condition", None))
+        used.update(condition_used)
+        for name in sorted(condition_used):
+            writer = current_writers.get(name)
+            if writer is not None and writer != chunk_index:
+                incoming_sources.setdefault(name, set()).add(writer)
+                outgoing_targets.setdefault(writer, {}).setdefault(name, set()).add(chunk_index)
+        for inner in getattr(stmt, "block", []) or []:
+            _scan_statement_dependencies(inner, chunk_index, current_writers, incoming_sources, outgoing_targets, defined, used)
+        return
+
+    if kind_name == "Box":
+        for inner in getattr(stmt, "body", []) or []:
+            _scan_statement_dependencies(inner, chunk_index, current_writers, incoming_sources, outgoing_targets, defined, used)
+        return
+
+    stmt_used, stmt_defined = _stmt_read_write_names(stmt)
+    used.update(stmt_used)
+    defined.update(stmt_defined)
+
+    for name in sorted(stmt_used):
+        writer = current_writers.get(name)
+        if writer is not None and writer != chunk_index:
+            incoming_sources.setdefault(name, set()).add(writer)
+            outgoing_targets.setdefault(writer, {}).setdefault(name, set()).add(chunk_index)
+
+    for name in sorted(stmt_defined):
+        current_writers[name] = chunk_index
 
 
 def compute_chunk_flows(chunk_texts: list[str], source_text: str) -> list[ChunkFlow]:
     """Analyze symbol flow between chunks."""
-    per_chunk: list[tuple[set[str], set[str]]] = [analyze_chunk_flow(text, source_text) for text in chunk_texts]
-    defined_indices: dict[str, list[int]] = {}
-    used_indices: dict[str, list[int]] = {}
-
-    for index, (defined, used) in enumerate(per_chunk, 1):
-        for name in defined:
-            defined_indices.setdefault(name, []).append(index)
-        for name in used:
-            used_indices.setdefault(name, []).append(index)
-
+    current_writers: dict[str, int] = {}
     flows: list[ChunkFlow] = []
-    for index, (defined, used) in enumerate(per_chunk, 1):
+    outgoing_by_source: dict[int, dict[str, set[int]]] = {}
+
+    for index, chunk_text in enumerate(chunk_texts, 1):
+        defined: set[str] = set()
+        used: set[str] = set()
         incoming_sources: dict[str, set[int]] = {}
-        outgoing_targets: dict[str, set[int]] = {}
+        prepared = prepare_chunk_text_for_run(chunk_text, source_text)
+        try:
+            program = parse(prepared)
+        except Exception:
+            program = None
 
-        for name in sorted(used):
-            source_candidates = [candidate for candidate in defined_indices.get(name, []) if candidate < index]
-            if source_candidates:
-                incoming_sources[name] = {max(source_candidates)}
+        if program is not None:
+            for stmt in getattr(program, "statements", []):
+                _scan_statement_dependencies(stmt, index, current_writers, incoming_sources, outgoing_by_source, defined, used)
 
-        for name in sorted(defined):
-            target_candidates = {candidate for candidate in used_indices.get(name, []) if candidate > index}
-            if target_candidates:
-                outgoing_targets[name] = target_candidates
+        outgoing_targets = outgoing_by_source.get(index, {})
 
         flows.append(
             ChunkFlow(
                 title=f"Chunk {index}",
-                original_text=chunk_texts[index - 1],
+                original_text=chunk_text,
                 rewritten_text="",
                 defined=defined,
                 used=used,
                 incoming_sources=incoming_sources,
-                outgoing_targets=outgoing_targets,
+                outgoing_targets={},
             )
         )
+
+    for index, flow in enumerate(flows, 1):
+        flow.outgoing_targets = outgoing_by_source.get(index, {})
 
     return flows
 
@@ -301,6 +444,34 @@ def format_flow_lines(mapping: dict[str, set[int]], arrow: str) -> str:
         chunks = ", ".join(f"Chunk {index}" for index in sorted(mapping[name]))
         parts.append(f"{name} {arrow} {chunks}")
     return "\n".join(parts)
+
+
+def _bold_qubit_name(name: str, qubit_names: set[str]) -> str:
+    escaped = html.escape(name)
+    if name in qubit_names:
+        return f"<b>{escaped}</b>"
+    return escaped
+
+
+def format_flow_lines_html(mapping: dict[str, set[int]], arrow: str, qubit_names: set[str]) -> str:
+    if not mapping:
+        return "none"
+    parts: list[str] = []
+    escaped_arrow = html.escape(arrow)
+    for name in sorted(mapping):
+        chunks = ", ".join(html.escape(f"Chunk {index}") for index in sorted(mapping[name]))
+        parts.append(f"{_bold_qubit_name(name, qubit_names)} {escaped_arrow} {chunks}")
+    return "\n".join(parts)
+
+
+def collect_qubit_register_names(circuit: Any) -> set[str]:
+    names: set[str] = set()
+    for qubit in getattr(circuit, "qubits", []) or []:
+        register = getattr(qubit, "_register", None)
+        name = getattr(register, "name", "") or ""
+        if name:
+            names.add(name)
+    return names
 
 
 class ChunkDagView(QGraphicsView):
@@ -814,6 +985,7 @@ class SplitWindow(QMainWindow):
         self.current_dqc_file: Path | None = None
         self.current_program: Any | None = None
         self.current_dqc_document: DqcDocument | None = None
+        self.chunk_dependency_qubits: set[str] = set()
         self.font_size = 10
         
         # Left pane: original code with split markers + tabbed DAG views
@@ -1114,14 +1286,16 @@ class SplitWindow(QMainWindow):
             rewritten, _, _ = transpile_for_split(source_text)
             circuit = qiskit_parse(rewritten)
             self.qiskit_dag_view.set_circuit(circuit, font)
+            self.chunk_dependency_qubits = collect_qubit_register_names(circuit)
         except Exception as exc:
             self.qiskit_dag_view.set_message(f"Qiskit DAG unavailable: {exc}", font)
+            self.chunk_dependency_qubits = set()
 
         flows = compute_chunk_flows([original for _, original, _ in chunks], source_text)
         self.flow_graph_view.set_flows(flows, font)
         return flows
 
-    def _make_flow_panel(self, title: str, text: str) -> QWidget:
+    def _make_flow_panel(self, title: str, text_html: str) -> QWidget:
         panel = QWidget()
         panel.setStyleSheet(
             "QWidget { background-color: #f3f3f3; border: 1px solid #d2d2d2; border-radius: 3px; }"
@@ -1137,13 +1311,16 @@ class SplitWindow(QMainWindow):
         header.setStyleSheet(f"color: {blue}; font-size: 10px; font-weight: 600; margin: 0px;")
         layout.addWidget(header)
 
-        body = QPlainTextEdit()
+        body = QTextEdit()
         body.setReadOnly(True)
-        body.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        body.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
         body.setFrameShape(QPlainTextEdit.Shape.NoFrame)
-        body.setStyleSheet(f"background: transparent; border: none; padding: 0px; margin: 0px; color: {blue};")
+        body.setStyleSheet(
+            f"background: transparent; border: none; padding: 0px; margin: 0px; color: {blue}; font-family: 'DejaVu Sans Mono';"
+        )
+        body.document().setDocumentMargin(0)
+        body.setHtml(f'<pre style="margin:0; color:{blue};">{text_html}</pre>')
         body.setFont(QFont("DejaVu Sans Mono", self.font_size))
-        body.setPlainText(text)
         body.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         layout.addWidget(body)
         layout.setStretch(0, 0)
@@ -1177,8 +1354,14 @@ class SplitWindow(QMainWindow):
             v.setContentsMargins(0, 0, 0, 0)
             v.setSpacing(4)
 
-            header = self._make_flow_panel("Importing:", format_flow_lines(flow.incoming_sources, "<-"))
-            footer = self._make_flow_panel("Exporting:", format_flow_lines(flow.outgoing_targets, "->"))
+            header = self._make_flow_panel(
+                "Importing:",
+                format_flow_lines_html(flow.incoming_sources, "<-", self.chunk_dependency_qubits),
+            )
+            footer = self._make_flow_panel(
+                "Exporting:",
+                format_flow_lines_html(flow.outgoing_targets, "->", self.chunk_dependency_qubits),
+            )
 
             bottom = QPlainTextEdit()
             bottom.setReadOnly(True)
