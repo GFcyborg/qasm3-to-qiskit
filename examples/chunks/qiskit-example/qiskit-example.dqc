@@ -23,6 +23,7 @@ gate my_gate(a) c, t {
   cx c, t;
 }
 
+pragma dqc.v1.split id=1
 // Gate modifiers work as well; this gate is equivalent to `p(-a) c;`.
 gate my_phase(a) c {
   ctrl @ inv @ gphase(a) c;
@@ -31,10 +32,10 @@ gate my_phase(a) c {
 // We handle mathematical expressions on gate creation and complex indexing
 // of temporary collections.
 my_gate(a * 2) aliased[0], q[{1, 2}][0];
-pragma dqc.v1.split id=1
 measure q[0] -> mid[0];
 measure q[1] -> mid[1];
 
+pragma dqc.v1.split id=2
 while (mid == "00") {
   reset q[0];
   reset q[1];

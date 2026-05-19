@@ -11,20 +11,20 @@ import sys
 import subprocess
 import json
 import shutil
+import math
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, cast
 
 import PySide6
-from PySide6.QtCore import Qt, QTimer, QSize, QRect, QEvent
-from PySide6.QtGui import QColor, QFont, QPainter, QAction, QKeySequence, QCursor, QTextCharFormat, QTextCursor
+from PySide6.QtCore import Qt, QTimer, QSize, QRect, QEvent, QPointF
+from PySide6.QtGui import QColor, QFont, QPainter, QAction, QKeySequence, QPen, QBrush, QTextCharFormat, QTextCursor, QPolygonF
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
     QWidget,
     QSplitter,
     QVBoxLayout,
-    QHBoxLayout,
     QPlainTextEdit,
     QLabel,
     QFileDialog,
@@ -32,9 +32,13 @@ from PySide6.QtWidgets import (
     QPushButton,
     QTabWidget,
     QStackedWidget,
-    QInputDialog,
-    
     QToolBar,
+    QSizePolicy,
+    QGraphicsView,
+    QGraphicsScene,
+    QGraphicsRectItem,
+    QGraphicsLineItem,
+    QGraphicsPolygonItem,
 )
 
 from openqasm3 import parse
@@ -158,6 +162,250 @@ def line_is_inside_blocking_scope(program: Any, line: int) -> bool:
 @dataclass(slots=True)
 class SplitPoint:
     line: int  # 1-indexed line number where to split AFTER
+
+
+@dataclass(slots=True)
+class ChunkFlow:
+    title: str
+    original_text: str
+    rewritten_text: str
+    defined: set[str]
+    used: set[str]
+    incoming_sources: dict[str, set[int]]
+    outgoing_targets: dict[str, set[int]]
+
+
+def _identifier_name(node: Any) -> str:
+    kind_name = kind(node)
+    if kind_name == "Identifier":
+        return getattr(node, "name", "") or ""
+    if kind_name == "IndexedIdentifier":
+        base = getattr(node, "name", None)
+        return getattr(base, "name", "") or ""
+    return ""
+
+
+def _stmt_defined_names(stmt: Any) -> set[str]:
+    kind_name = kind(stmt)
+    if kind_name == "QubitDeclaration":
+        name_obj = getattr(stmt, "identifier", None) or getattr(stmt, "qubit", None)
+        name = getattr(name_obj, "name", "") or ""
+        return {name} if name else set()
+    if kind_name in {"ClassicalDeclaration", "IODeclaration"}:
+        name = getattr(getattr(stmt, "identifier", None), "name", "") or ""
+        return {name} if name else set()
+    if kind_name == "AliasStatement":
+        name = getattr(getattr(stmt, "target", None), "name", "") or ""
+        return {name} if name else set()
+    if kind_name == "QuantumMeasurementStatement":
+        target = getattr(stmt, "target", None)
+        name = _identifier_name(target)
+        return {name} if name else set()
+    if kind_name == "ClassicalAssignment":
+        name = _identifier_name(getattr(stmt, "lvalue", None))
+        return {name} if name else set()
+    if kind_name in {"QuantumGateDefinition", "SubroutineDefinition", "CalibrationDefinition"}:
+        name = getattr(getattr(stmt, "name", None), "name", "") or getattr(getattr(stmt, "identifier", None), "name", "") or ""
+        return {name} if name else set()
+    return set()
+
+
+def _stmt_used_names(stmt: Any) -> set[str]:
+    kind_name = kind(stmt)
+    if kind_name in {"QuantumGateDefinition", "SubroutineDefinition", "CalibrationDefinition"}:
+        return set()
+
+    used: set[str] = set()
+    for node in node_iter(stmt):
+        name = _identifier_name(node)
+        if name:
+            used.add(name)
+    used -= _stmt_defined_names(stmt)
+    return used
+
+
+def analyze_chunk_flow(chunk_text: str, source_text: str) -> tuple[set[str], set[str]]:
+    """Return (defined_names, used_names) for a single chunk."""
+    prepared = prepare_chunk_text_for_run(chunk_text, source_text)
+    try:
+        program = parse(prepared)
+    except Exception:
+        return set(), set()
+
+    defined: set[str] = set()
+    used: set[str] = set()
+    for stmt in getattr(program, "statements", []):
+        defined |= _stmt_defined_names(stmt)
+        used |= _stmt_used_names(stmt)
+    return defined, used
+
+
+def compute_chunk_flows(chunk_texts: list[str], source_text: str) -> list[ChunkFlow]:
+    """Analyze symbol flow between chunks."""
+    per_chunk: list[tuple[set[str], set[str]]] = [analyze_chunk_flow(text, source_text) for text in chunk_texts]
+    defined_indices: dict[str, list[int]] = {}
+    used_indices: dict[str, list[int]] = {}
+
+    for index, (defined, used) in enumerate(per_chunk, 1):
+        for name in defined:
+            defined_indices.setdefault(name, []).append(index)
+        for name in used:
+            used_indices.setdefault(name, []).append(index)
+
+    flows: list[ChunkFlow] = []
+    for index, (defined, used) in enumerate(per_chunk, 1):
+        incoming_sources: dict[str, set[int]] = {}
+        outgoing_targets: dict[str, set[int]] = {}
+
+        for name in sorted(used):
+            source_candidates = [candidate for candidate in defined_indices.get(name, []) if candidate < index]
+            if source_candidates:
+                incoming_sources[name] = {max(source_candidates)}
+
+        for name in sorted(defined):
+            target_candidates = {candidate for candidate in used_indices.get(name, []) if candidate > index}
+            if target_candidates:
+                outgoing_targets[name] = target_candidates
+
+        flows.append(
+            ChunkFlow(
+                title=f"Chunk {index}",
+                original_text=chunk_texts[index - 1],
+                rewritten_text="",
+                defined=defined,
+                used=used,
+                incoming_sources=incoming_sources,
+                outgoing_targets=outgoing_targets,
+            )
+        )
+
+    return flows
+
+
+def format_flow_lines(mapping: dict[str, set[int]], arrow: str) -> str:
+    if not mapping:
+        return "none"
+    parts: list[str] = []
+    for name in sorted(mapping):
+        chunks = ", ".join(f"Chunk {index}" for index in sorted(mapping[name]))
+        parts.append(f"{name} {arrow} {chunks}")
+    return "\n".join(parts)
+
+
+class ChunkDagView(QGraphicsView):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setScene(QGraphicsScene(self))
+        self.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        self.setBackgroundBrush(QColor("#f8fbf7"))
+        self.setStyleSheet("border: 1px solid #d0d0d0;")
+
+    def set_flows(self, flows: list[ChunkFlow], font: QFont) -> None:
+        scene = self.scene()
+        if scene is None:
+            scene = QGraphicsScene(self)
+            self.setScene(scene)
+        scene.clear()
+
+        if not flows:
+            empty = scene.addSimpleText("No dependency DAG available")
+            empty.setFont(font)
+            empty.setBrush(QBrush(QColor("#555555")))
+            scene.setSceneRect(empty.boundingRect().adjusted(-10, -10, 10, 10))
+            return
+
+        node_w = 320.0
+        node_h = 72.0
+        gap = 28.0
+        left = 20.0
+        top = 20.0
+
+        node_items: dict[int, tuple[QGraphicsRectItem, float, float]] = {}
+        for index, flow in enumerate(flows, 1):
+            y = top + (index - 1) * (node_h + gap)
+            rect = scene.addRect(left, y, node_w, node_h, QPen(QColor("#6d8f6a")), QBrush(QColor("#eef6ec")))
+            title = scene.addSimpleText(flow.title)
+            title.setFont(font)
+            title.setBrush(QBrush(QColor("#223322")))
+            title.setPos(left + 10, y + 6)
+
+            incoming = scene.addSimpleText(f"in: {len(flow.incoming_sources)}")
+            incoming.setFont(font)
+            incoming.setBrush(QBrush(QColor("#345")))
+            incoming.setPos(left + 10, y + 30)
+
+            outgoing = scene.addSimpleText(f"out: {len(flow.outgoing_targets)}")
+            outgoing.setFont(font)
+            outgoing.setBrush(QBrush(QColor("#345")))
+            outgoing.setPos(left + 110, y + 30)
+
+            summary = scene.addSimpleText(", ".join(sorted(flow.defined)) if flow.defined else "no defs")
+            summary.setFont(font)
+            summary.setBrush(QBrush(QColor("#556")))
+            summary.setPos(left + 10, y + 50)
+
+            node_items[index] = (rect, left, y)
+
+        edge_labels: dict[tuple[int, int], list[str]] = {}
+        for index, flow in enumerate(flows, 1):
+            for name, sources in flow.incoming_sources.items():
+                for source in sources:
+                    edge_labels.setdefault((source, index), []).append(name)
+
+        edge_color = QColor("#2f6fff")
+        edge_pen = QPen(edge_color)
+        edge_pen.setWidthF(1.4)
+        for (source, dest), labels in sorted(edge_labels.items()):
+            _, x1, y1 = node_items[source]
+            _, x2, y2 = node_items[dest]
+            start_x = x1 + node_w
+            start_y = y1 + node_h / 2
+            end_x = x2
+            end_y = y2 + node_h / 2
+            angle = math.atan2(end_y - start_y, end_x - start_x)
+            arrow_size = 9.0
+            line_end_x = end_x - math.cos(angle) * arrow_size
+            line_end_y = end_y - math.sin(angle) * arrow_size
+
+            line = QGraphicsLineItem(start_x, start_y, line_end_x, line_end_y)
+            line.setPen(edge_pen)
+            scene.addItem(line)
+
+            arrow_head = QPolygonF([
+                QPointF(end_x, end_y),
+                QPointF(
+                    line_end_x - math.cos(angle - math.pi / 6) * arrow_size,
+                    line_end_y - math.sin(angle - math.pi / 6) * arrow_size,
+                ),
+                QPointF(
+                    line_end_x - math.cos(angle + math.pi / 6) * arrow_size,
+                    line_end_y - math.sin(angle + math.pi / 6) * arrow_size,
+                ),
+            ])
+            arrow = QGraphicsPolygonItem(arrow_head)
+            arrow.setPen(QPen(edge_color))
+            arrow.setBrush(QBrush(edge_color))
+            scene.addItem(arrow)
+
+            label = scene.addSimpleText(", ".join(sorted(labels)))
+            label_font = QFont(font)
+            label_font.setBold(True)
+            if label_font.pointSizeF() > 0:
+                label_font.setPointSizeF(label_font.pointSizeF() + 3.0)
+            elif label_font.pointSize() > 0:
+                label_font.setPointSize(label_font.pointSize() + 3)
+            else:
+                label_font.setPointSize(13)
+            label.setFont(label_font)
+            label.setBrush(QBrush(edge_color))
+            label_rect = label.boundingRect().adjusted(-6, -3, 6, 3)
+            midpoint_x = (start_x + end_x) / 2
+            midpoint_y = (start_y + end_y) / 2
+            label_x = midpoint_x - label_rect.width() / 2
+            label_y = midpoint_y - label_rect.height() / 2 - 10
+            label.setPos(label_x, label_y)
+
+        scene.setSceneRect(scene.itemsBoundingRect().adjusted(-20, -20, 20, 20))
 
 
 class CodeEditor(QPlainTextEdit):
@@ -295,9 +543,20 @@ class SplitWindow(QMainWindow):
         self.current_dqc_document: DqcDocument | None = None
         self.font_size = 10
         
-        # Left pane: original code with split markers
+        # Left pane: original code with split markers + dependency DAG
         self.editor = CodeEditor()
         editor_panel, _ = self.make_titled_panel("QASM original (right-click to toggle split)", "#d8ecff", self.editor)
+
+        self.flow_graph_view = ChunkDagView()
+        self.flow_graph_view.setMinimumHeight(180)
+        dag_panel, _ = self.make_titled_panel("QASM dependency DAG", "#dbeed8", self.flow_graph_view)
+
+        left_splitter = QSplitter(Qt.Orientation.Vertical)
+        left_splitter.addWidget(editor_panel)
+        left_splitter.addWidget(dag_panel)
+        left_splitter.setStretchFactor(0, 3)
+        left_splitter.setStretchFactor(1, 1)
+        left_splitter.setSizes([640, 220])
         
         # Right pane: rewritten preview or tabbed chunks
         self.rewritten_chunk_view = QPlainTextEdit()
@@ -311,7 +570,7 @@ class SplitWindow(QMainWindow):
         
         # Main horizontal splitter (full height)
         main_splitter = QSplitter(Qt.Orientation.Horizontal)
-        main_splitter.addWidget(editor_panel)
+        main_splitter.addWidget(left_splitter)
         main_splitter.addWidget(chunk_panel)
         main_splitter.setStretchFactor(0, 1)
         main_splitter.setStretchFactor(1, 1)
@@ -408,7 +667,7 @@ class SplitWindow(QMainWindow):
 
     def apply_font(self) -> None:
         font = QFont("DejaVu Sans Mono", self.font_size)
-        for widget in (self.editor, self.rewritten_chunk_view, self.chunk_tabs):
+        for widget in (self.editor, self.rewritten_chunk_view, self.chunk_tabs, self.flow_graph_view):
             widget.setFont(font)
 
     def set_font_size(self, size: int) -> None:
@@ -569,53 +828,48 @@ class SplitWindow(QMainWindow):
 
         return result
 
+    def _make_flow_panel(self, title: str, text: str) -> QWidget:
+        panel = QWidget()
+        panel.setStyleSheet(
+            "QWidget { background-color: #f3f3f3; border: 1px solid #d2d2d2; border-radius: 3px; }"
+        )
+        blue = "#2f6fff"
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(3, 1, 3, 1)
+        layout.setSpacing(0)
+
+        header = QLabel(title)
+        header.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        header.setFixedHeight(12)
+        header.setStyleSheet(f"color: {blue}; font-size: 10px; font-weight: 600; margin: 0px;")
+        layout.addWidget(header)
+
+        body = QPlainTextEdit()
+        body.setReadOnly(True)
+        body.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        body.setFrameShape(QPlainTextEdit.Shape.NoFrame)
+        body.setStyleSheet(f"background: transparent; border: none; padding: 0px; margin: 0px; color: {blue};")
+        body.setFont(QFont("DejaVu Sans Mono", self.font_size))
+        body.setPlainText(text)
+        body.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        layout.addWidget(body)
+        layout.setStretch(0, 0)
+        layout.setStretch(1, 1)
+
+        return panel
+
     def refresh_chunk_view(self) -> None:
         """Refresh the rewritten preview or split chunk tabs."""
         if not self.current_file and self.current_dqc_document is None:
             return
 
-        if self.current_dqc_document is not None:
-            document = parse_dqc_text(self.editor.toPlainText())
-            chunks = document.chunks
-
-            if len(chunks) <= 1 or not self.editor.split_points:
-                self.chunk_stack.setCurrentWidget(self.rewritten_chunk_view)
-                rewritten = ""
-                if chunks:
-                    try:
-                        rewritten, _, _ = transpile_for_split(document.raw_text)
-                    except Exception as exc:
-                        rewritten = f"[ERROR: {exc}]"
-                apply_gray_include_format(self.rewritten_chunk_view, rewritten)
-                return
-
-            self.chunk_stack.setCurrentWidget(self.chunk_tabs)
-            self.chunk_tabs.clear()
-
-            for chunk in chunks:
-                # Container widget with top references area and bottom rewritten code
-                container = QWidget()
-                v = QVBoxLayout(container)
-                v.setContentsMargins(0, 0, 0, 0)
-                v.setSpacing(2)
-
-                bottom = QPlainTextEdit()
-                bottom.setReadOnly(True)
-                bottom.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-                bottom.setFont(QFont("DejaVu Sans Mono", self.font_size))
-                try:
-                    chunk_text = prepare_chunk_text_for_run(chunk.text, document.raw_text)
-                    rewritten, _, _ = transpile_for_split(chunk_text)
-                except Exception as exc:
-                    rewritten = f"[ERROR: {exc}]"
-                apply_gray_include_format(bottom, rewritten)
-
-                v.addWidget(bottom)
-
-                self.chunk_tabs.addTab(container, f"Chunk {chunk.index}")
-            return
-
         chunks = self.preview_chunks()
+        source_text = self.editor.toPlainText()
+        if self.current_dqc_document is not None:
+            source_text = parse_dqc_text(source_text).raw_text
+
+        flows = compute_chunk_flows([original for _, original, _ in chunks], source_text)
+        self.flow_graph_view.set_flows(flows, QFont("DejaVu Sans Mono", self.font_size))
 
         if not self.editor.split_points:
             self.chunk_stack.setCurrentWidget(self.rewritten_chunk_view)
@@ -626,12 +880,14 @@ class SplitWindow(QMainWindow):
         self.chunk_stack.setCurrentWidget(self.chunk_tabs)
         self.chunk_tabs.clear()
 
-        # For non-DQC chunks, chunks is a list of (name, original, rewritten)
-        for (name, _, rewritten) in chunks:
+        for (name, _, rewritten), flow in zip(chunks, flows):
             container = QWidget()
             v = QVBoxLayout(container)
             v.setContentsMargins(0, 0, 0, 0)
-            v.setSpacing(2)
+            v.setSpacing(4)
+
+            header = self._make_flow_panel("Importing:", format_flow_lines(flow.incoming_sources, "<-"))
+            footer = self._make_flow_panel("Exporting:", format_flow_lines(flow.outgoing_targets, "->"))
 
             bottom = QPlainTextEdit()
             bottom.setReadOnly(True)
@@ -639,7 +895,12 @@ class SplitWindow(QMainWindow):
             bottom.setFont(QFont("DejaVu Sans Mono", self.font_size))
             apply_gray_include_format(bottom, rewritten)
 
+            v.addWidget(header)
             v.addWidget(bottom)
+            v.addWidget(footer)
+            v.setStretch(0, 1)
+            v.setStretch(1, 2)
+            v.setStretch(2, 1)
 
             self.chunk_tabs.addTab(container, name)
 
