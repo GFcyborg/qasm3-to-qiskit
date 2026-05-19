@@ -12,13 +12,14 @@ import subprocess
 import json
 import shutil
 import math
+import time
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, cast
 
 import PySide6
 from PySide6.QtCore import Qt, QTimer, QSize, QRect, QEvent, QPointF
-from PySide6.QtGui import QColor, QFont, QPainter, QAction, QKeySequence, QPen, QBrush, QTextCharFormat, QTextCursor, QPolygonF
+from PySide6.QtGui import QColor, QFont, QFontMetricsF, QPainter, QAction, QKeySequence, QPen, QBrush, QTextCharFormat, QTextCursor, QPolygonF
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -33,6 +34,7 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QStackedWidget,
     QToolBar,
+    QMenu,
     QSizePolicy,
     QGraphicsView,
     QGraphicsScene,
@@ -57,6 +59,8 @@ from dqc_container import (
     prepare_chunk_text_for_run,
     render_dqc_text,
 )
+from qiskit.converters import circuit_to_dag
+from qiskit_qasm3_import import parse as qiskit_parse
 
 
 ROOT = Path(__file__).resolve().parent
@@ -173,6 +177,13 @@ class ChunkFlow:
     used: set[str]
     incoming_sources: dict[str, set[int]]
     outgoing_targets: dict[str, set[int]]
+
+
+def wire_label(wire: Any) -> str:
+    register = getattr(wire, "_register", None)
+    register_name = getattr(register, "name", "wire")
+    index = getattr(wire, "_index", 0)
+    return f"{register_name}[{index}]"
 
 
 def _identifier_name(node: Any) -> str:
@@ -307,16 +318,24 @@ class ChunkDagView(QGraphicsView):
             self.setScene(scene)
         scene.clear()
 
+        node_font = QFont(font)
+        if node_font.pointSizeF() > 0:
+            node_font.setPointSizeF(max(7.0, node_font.pointSizeF() - 2.0))
+        elif node_font.pointSize() > 0:
+            node_font.setPointSize(max(7, node_font.pointSize() - 2))
+        else:
+            node_font.setPointSize(8)
+
         if not flows:
             empty = scene.addSimpleText("No dependency DAG available")
-            empty.setFont(font)
+            empty.setFont(node_font)
             empty.setBrush(QBrush(QColor("#555555")))
             scene.setSceneRect(empty.boundingRect().adjusted(-10, -10, 10, 10))
             return
 
         node_w = 320.0
         node_h = 72.0
-        gap = 28.0
+        gap = 60.0
         left = 20.0
         top = 20.0
 
@@ -325,22 +344,22 @@ class ChunkDagView(QGraphicsView):
             y = top + (index - 1) * (node_h + gap)
             rect = scene.addRect(left, y, node_w, node_h, QPen(QColor("#6d8f6a")), QBrush(QColor("#eef6ec")))
             title = scene.addSimpleText(flow.title)
-            title.setFont(font)
+            title.setFont(node_font)
             title.setBrush(QBrush(QColor("#223322")))
             title.setPos(left + 10, y + 6)
 
             incoming = scene.addSimpleText(f"in: {len(flow.incoming_sources)}")
-            incoming.setFont(font)
+            incoming.setFont(node_font)
             incoming.setBrush(QBrush(QColor("#345")))
             incoming.setPos(left + 10, y + 30)
 
             outgoing = scene.addSimpleText(f"out: {len(flow.outgoing_targets)}")
-            outgoing.setFont(font)
+            outgoing.setFont(node_font)
             outgoing.setBrush(QBrush(QColor("#345")))
             outgoing.setPos(left + 110, y + 30)
 
-            summary = scene.addSimpleText(", ".join(sorted(flow.defined)) if flow.defined else "no defs")
-            summary.setFont(font)
+            summary = scene.addSimpleText("declared/used: " + (", ".join(sorted(flow.defined)) if flow.defined else "none"))
+            summary.setFont(node_font)
             summary.setBrush(QBrush(QColor("#556")))
             summary.setPos(left + 10, y + 50)
 
@@ -402,10 +421,264 @@ class ChunkDagView(QGraphicsView):
             midpoint_x = (start_x + end_x) / 2
             midpoint_y = (start_y + end_y) / 2
             label_x = midpoint_x - label_rect.width() / 2
-            label_y = midpoint_y - label_rect.height() / 2 - 10
+            label_y = midpoint_y - label_rect.height() / 2
             label.setPos(label_x, label_y)
 
         scene.setSceneRect(scene.itemsBoundingRect().adjusted(-20, -20, 20, 20))
+
+
+class QiskitDagView(QGraphicsView):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setScene(QGraphicsScene(self))
+        self.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        self.setBackgroundBrush(QColor("#f7faff"))
+        self.setStyleSheet("border: 1px solid #d0d0d0;")
+        self._dragging = False
+        self._drag_start_pos: tuple[int, int] | None = None
+        self._scroll_bar_start: tuple[int, int] | None = None
+        self._user_interacted = False
+        self._last_user_interaction: float = 0.0
+
+    def set_message(self, message: str, font: QFont) -> None:
+        scene = self.scene()
+        if scene is None:
+            scene = QGraphicsScene(self)
+            self.setScene(scene)
+        scene.clear()
+        text = scene.addSimpleText(message)
+        text.setFont(font)
+        text.setBrush(QBrush(QColor("#555555")))
+        scene.setSceneRect(text.boundingRect().adjusted(-12, -12, 12, 12))
+        if not self._user_interacted:
+            self.resetTransform()
+            self.fitInView(text.boundingRect(), Qt.AspectRatioMode.KeepAspectRatio)
+            self.centerOn(text.boundingRect().center())
+
+    def set_circuit(self, circuit: Any, font: QFont) -> None:
+        scene = self.scene()
+        if scene is None:
+            scene = QGraphicsScene(self)
+            self.setScene(scene)
+        scene.clear()
+
+        try:
+            dag = circuit_to_dag(circuit)
+        except Exception as exc:
+            self.set_message(f"Qiskit DAG unavailable: {exc}", font)
+            return
+
+        qubits = list(getattr(dag, "qubits", []) or [])
+        clbits = list(getattr(dag, "clbits", []) or [])
+        wires = qubits + clbits
+        op_nodes = list(dag.topological_op_nodes())
+        if not wires:
+            self.set_message("No wires available for DAG rendering", font)
+            return
+        if not op_nodes:
+            self.set_message("No operation nodes available for DAG rendering", font)
+            return
+
+        node_font = QFont(font)
+        if node_font.pointSizeF() > 0:
+            node_font.setPointSizeF(max(7.0, node_font.pointSizeF() - 2.0))
+        elif node_font.pointSize() > 0:
+            node_font.setPointSize(max(7, node_font.pointSize() - 2))
+        else:
+            node_font.setPointSize(8)
+
+        left = 96.0
+        top = 34.0
+        wire_gap = 42.0
+        layer_gap = 140.0
+        node_h = 28.0
+
+        metrics = QFontMetricsF(node_font)
+        node_widths: list[float] = [max(44.0, metrics.horizontalAdvance(getattr(node, "name", "op")) + 18.0) for node in op_nodes]
+
+        wire_y: dict[Any, float] = {wire: top + index * wire_gap for index, wire in enumerate(wires)}
+        max_node_w = max(node_widths, default=44.0)
+        scene_right = left + max(1, len(op_nodes) - 1) * layer_gap + max_node_w + 40.0
+        edge_pen = QPen(QColor("#2f6fff"))
+        edge_pen.setWidthF(1.4)
+
+        for wire, y in wire_y.items():
+            label = scene.addSimpleText(wire_label(wire))
+            label.setFont(node_font)
+            label.setBrush(QBrush(QColor("#5b6d8a")))
+            label.setPos(10, y - label.boundingRect().height() / 2)
+            scene.addLine(left - 8, y, scene_right, y, QPen(QColor("#d7deea")))
+
+        last_x: dict[Any, float] = {wire: left - 8 for wire in wires}
+        for index, node in enumerate(op_nodes):
+            node_w = node_widths[index]
+            node_wires = list(getattr(node, "qargs", []) or []) + list(getattr(node, "cargs", []) or [])
+            if not node_wires:
+                continue
+
+            x_center = left + index * layer_gap
+            y_center = sum(wire_y[wire] for wire in node_wires) / len(node_wires)
+            if len(node_wires) > 1:
+                y_center += (index % 2) * 6.0
+
+            node_rect = scene.addRect(
+                x_center - node_w / 2,
+                y_center - node_h / 2,
+                node_w,
+                node_h,
+                QPen(QColor("#4a74b6")),
+                QBrush(QColor("#e8f0ff")),
+            )
+            node_rect.setZValue(2)
+
+            label = scene.addSimpleText(getattr(node, "name", "op"))
+            label.setFont(node_font)
+            label.setBrush(QBrush(QColor("#20304e")))
+            label_rect = label.boundingRect()
+            label.setPos(
+                x_center - label_rect.width() / 2,
+                y_center - label_rect.height() / 2,
+            )
+            label.setZValue(3)
+
+            for wire in node_wires:
+                start_x = last_x[wire]
+                start_y = wire_y[wire]
+                end_x = x_center - node_w / 2
+                end_y = y_center
+                angle = math.atan2(end_y - start_y, end_x - start_x)
+                arrow_size = 8.0
+                line_end_x = end_x - math.cos(angle) * arrow_size
+                line_end_y = end_y - math.sin(angle) * arrow_size
+
+                line = QGraphicsLineItem(start_x, start_y, line_end_x, line_end_y)
+                line.setPen(edge_pen)
+                scene.addItem(line)
+
+                arrow_head = QPolygonF([
+                    QPointF(end_x, end_y),
+                    QPointF(
+                        line_end_x - math.cos(angle - math.pi / 6) * arrow_size,
+                        line_end_y - math.sin(angle - math.pi / 6) * arrow_size,
+                    ),
+                    QPointF(
+                        line_end_x - math.cos(angle + math.pi / 6) * arrow_size,
+                        line_end_y - math.sin(angle + math.pi / 6) * arrow_size,
+                    ),
+                ])
+                arrow = QGraphicsPolygonItem(arrow_head)
+                arrow.setPen(QPen(QColor("#2f6fff")))
+                arrow.setBrush(QBrush(QColor("#2f6fff")))
+                scene.addItem(arrow)
+
+                last_x[wire] = x_center + node_w / 2
+
+        scene.setSceneRect(scene.itemsBoundingRect().adjusted(-20, -20, 20, 20))
+        self._user_interacted = False
+        self._last_user_interaction = 0.0
+        self.resetTransform()
+        self.fitInView(scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        self.centerOn(scene.sceneRect().center())
+
+    def mousePressEvent(self, event: Any) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = True
+            self._user_interacted = True
+            self._last_user_interaction = time.monotonic()
+            pos = event.position().toPoint()
+            self._drag_start_pos = (pos.x(), pos.y())
+            self._scroll_bar_start = (
+                self.horizontalScrollBar().value(),
+                self.verticalScrollBar().value(),
+            )
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: Any) -> None:
+        if self._dragging and self._drag_start_pos and self._scroll_bar_start:
+            pos = event.position().toPoint()
+            dx = pos.x() - self._drag_start_pos[0]
+            dy = pos.y() - self._drag_start_pos[1]
+            self._user_interacted = True
+            self._last_user_interaction = time.monotonic()
+            self.horizontalScrollBar().setValue(self._scroll_bar_start[0] - dx)
+            self.verticalScrollBar().setValue(self._scroll_bar_start[1] - dy)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: Any) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = False
+            self._drag_start_pos = None
+            self._scroll_bar_start = None
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            self._last_user_interaction = time.monotonic()
+        super().mouseReleaseEvent(event)
+
+    def wheelEvent(self, event: Any) -> None:
+        factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+        self._interactive_scale(factor)
+        self._last_user_interaction = time.monotonic()
+
+    def contextMenuEvent(self, event: Any) -> None:
+        menu = QMenu(self)
+
+        def _reset_zoom() -> None:
+            self._user_interacted = False
+            self._auto_fit()
+
+        menu.addAction("Reset zoom", _reset_zoom)
+        menu.exec(event.globalPos())
+
+    def resizeEvent(self, event: Any) -> None:
+        super().resizeEvent(event)
+        if not self._user_interacted:
+            self._auto_fit()
+
+    def _auto_fit(self) -> None:
+        scene_rect = self.scene().itemsBoundingRect()
+        if scene_rect.isNull():
+            return
+        self.resetTransform()
+        self.fitInView(scene_rect, Qt.AspectRatioMode.KeepAspectRatio)
+        self.centerOn(scene_rect.center())
+
+    def _current_uniform_scale(self) -> float:
+        try:
+            val = float(self.transform().m11())
+        except Exception:
+            return 1.0
+        if not math.isfinite(val):
+            return 1.0
+        return max(1e-6, min(val, 1e6))
+
+    def _compute_fit_scale(self) -> float:
+        scene_rect = self.scene().itemsBoundingRect()
+        if scene_rect.isNull():
+            return 1.0
+        view_w = self.viewport().width()
+        view_h = self.viewport().height()
+        scene_w = scene_rect.width()
+        scene_h = scene_rect.height()
+        if scene_w <= 0 or scene_h <= 0 or view_w <= 0 or view_h <= 0:
+            return 1.0
+        scale_w = view_w / scene_w
+        scale_h = view_h / scene_h
+        return float(max(1e-6, min(scale_w, scale_h)))
+
+    def _interactive_scale(self, factor: float) -> None:
+        cur = self._current_uniform_scale()
+        target = cur * factor
+        fit = self._compute_fit_scale()
+        eps = 1e-9
+        if factor < 1.0:
+            if cur <= fit * (1.0 + eps):
+                return
+            if target <= fit * (1.0 + eps):
+                self._user_interacted = False
+                self._auto_fit()
+                return
+        self.scale(factor, factor)
+        self._user_interacted = True
 
 
 class CodeEditor(QPlainTextEdit):
@@ -543,13 +816,19 @@ class SplitWindow(QMainWindow):
         self.current_dqc_document: DqcDocument | None = None
         self.font_size = 10
         
-        # Left pane: original code with split markers + dependency DAG
+        # Left pane: original code with split markers + tabbed DAG views
         self.editor = CodeEditor()
         editor_panel, _ = self.make_titled_panel("QASM original (right-click to toggle split)", "#d8ecff", self.editor)
 
+        self.qiskit_dag_view = QiskitDagView()
         self.flow_graph_view = ChunkDagView()
+        self.qiskit_dag_view.setMinimumHeight(180)
         self.flow_graph_view.setMinimumHeight(180)
-        dag_panel, _ = self.make_titled_panel("QASM dependency DAG", "#dbeed8", self.flow_graph_view)
+        self.dag_tabs = QTabWidget()
+        self.dag_tabs.addTab(self.qiskit_dag_view, "Overall DAG")
+        self.dag_tabs.addTab(self.flow_graph_view, "Chunk dependencies")
+        self.dag_tabs.setCurrentIndex(0)
+        dag_panel, _ = self.make_titled_panel("DAG views", "#dbeed8", self.dag_tabs)
 
         left_splitter = QSplitter(Qt.Orientation.Vertical)
         left_splitter.addWidget(editor_panel)
@@ -667,7 +946,7 @@ class SplitWindow(QMainWindow):
 
     def apply_font(self) -> None:
         font = QFont("DejaVu Sans Mono", self.font_size)
-        for widget in (self.editor, self.rewritten_chunk_view, self.chunk_tabs, self.flow_graph_view):
+        for widget in (self.editor, self.rewritten_chunk_view, self.chunk_tabs, self.dag_tabs, self.qiskit_dag_view, self.flow_graph_view):
             widget.setFont(font)
 
     def set_font_size(self, size: int) -> None:
@@ -828,6 +1107,20 @@ class SplitWindow(QMainWindow):
 
         return result
 
+    def refresh_dag_views(self, chunks: list[tuple[str, str, str]], source_text: str) -> list[ChunkFlow]:
+        font = QFont("DejaVu Sans Mono", self.font_size)
+
+        try:
+            rewritten, _, _ = transpile_for_split(source_text)
+            circuit = qiskit_parse(rewritten)
+            self.qiskit_dag_view.set_circuit(circuit, font)
+        except Exception as exc:
+            self.qiskit_dag_view.set_message(f"Qiskit DAG unavailable: {exc}", font)
+
+        flows = compute_chunk_flows([original for _, original, _ in chunks], source_text)
+        self.flow_graph_view.set_flows(flows, font)
+        return flows
+
     def _make_flow_panel(self, title: str, text: str) -> QWidget:
         panel = QWidget()
         panel.setStyleSheet(
@@ -867,9 +1160,7 @@ class SplitWindow(QMainWindow):
         source_text = self.editor.toPlainText()
         if self.current_dqc_document is not None:
             source_text = parse_dqc_text(source_text).raw_text
-
-        flows = compute_chunk_flows([original for _, original, _ in chunks], source_text)
-        self.flow_graph_view.set_flows(flows, QFont("DejaVu Sans Mono", self.font_size))
+        flows = self.refresh_dag_views(chunks, source_text)
 
         if not self.editor.split_points:
             self.chunk_stack.setCurrentWidget(self.rewritten_chunk_view)
