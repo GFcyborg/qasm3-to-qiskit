@@ -335,6 +335,68 @@ def minimal_transpile(source: str) -> tuple[str, list[Issue], Any | None]:
             program = None
         return source, [], program
 
+    def _normalize_qasm3_prologue(text: str) -> str:
+        lines = text.splitlines()
+        body_lines: list[str] = []
+        removed_header = False
+        removed_stdgates = False
+        for line in lines:
+            stripped = line.strip()
+            if not removed_header and re.match(r"(?mi)^[ \t]*OPENQASM\b", line):
+                removed_header = True
+                continue
+            if not removed_stdgates and re.match(r'(?mi)^\s*include\s+"stdgates\.inc"\s*;', line):
+                removed_stdgates = True
+                continue
+            body_lines.append(line)
+
+        prologue = ["OPENQASM 3.0;", 'include "stdgates.inc";']
+        if body_lines:
+            return "\n".join(prologue + body_lines)
+        return "\n".join(prologue)
+
+    def _synthesize_measurement_targets(text: str) -> str:
+        lines = text.splitlines()
+        bare_measurements: list[tuple[int, str]] = []
+        for index, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped or stripped.startswith("//"):
+                continue
+            if "measure" not in stripped or "=" in stripped:
+                continue
+            match = re.match(r"^measure\s+(.+?);\s*$", stripped)
+            if match:
+                bare_measurements.append((index, match.group(1).strip()))
+
+        if not bare_measurements:
+            return text
+
+        bit_name = "c"
+        while re.search(rf"\b{re.escape(bit_name)}\b", text):
+            bit_name += "_"
+
+        bit_decl = f"bit[{len(bare_measurements)}] {bit_name};"
+        rewritten_lines = list(lines)
+        for meas_index, operand in bare_measurements:
+            rewritten_lines[meas_index] = f"{bit_name}[{bare_measurements.index((meas_index, operand))}] = measure {operand};"
+
+        insert_at = 0
+        if rewritten_lines and rewritten_lines[0].strip().upper().startswith("OPENQASM"):
+            insert_at = 1
+            if len(rewritten_lines) > 1 and re.match(r'(?mi)^\s*include\s+"stdgates\.inc"\s*;', rewritten_lines[1]):
+                insert_at = 2
+        while insert_at < len(rewritten_lines):
+            stripped = rewritten_lines[insert_at].strip()
+            if not stripped:
+                insert_at += 1
+                continue
+            if re.match(r"^(qubit|bit)\b", stripped):
+                insert_at += 1
+                continue
+            break
+        rewritten_lines.insert(insert_at, bit_decl)
+        return "\n".join(rewritten_lines)
+
     program_original: Any | None
     try:
         program_original = parse(source)
@@ -374,6 +436,8 @@ def minimal_transpile(source: str) -> tuple[str, list[Issue], Any | None]:
         insert_at = 0
         if out_lines and out_lines[0].strip().upper().startswith("OPENQASM"):
             insert_at = 1
+            if len(out_lines) > 1 and re.match(r'(?mi)^\s*include\s+"stdgates\.inc"\s*;', out_lines[1]):
+                insert_at = 2
         out_lines.insert(insert_at, hw_decl)
         text = "\n".join(out_lines)
 
@@ -539,6 +603,9 @@ def minimal_transpile(source: str) -> tuple[str, list[Issue], Any | None]:
     # Emitting individual statements drops the program version line; restore it.
     if not re.search(r"(?mi)^[ \t]*OPENQASM\b", text):
         text = "OPENQASM 3.0;\n" + text
+
+    text = _normalize_qasm3_prologue(text)
+    text = _synthesize_measurement_targets(text)
 
     def _rewrite_simple_if_guard(line: str) -> str:
         stripped = line.lstrip()
@@ -1370,7 +1437,7 @@ class MainWindow(QMainWindow):
 
     def build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("File")
-        open_action = QAction("Open QASM/DQC...", self)
+        open_action = QAction("Open QASM file...", self)
         open_action.triggered.connect(self.open_file)
         file_menu.addAction(open_action)
         examples_menu = file_menu.addMenu("Examples")
