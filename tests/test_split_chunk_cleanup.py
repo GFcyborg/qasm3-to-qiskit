@@ -2,7 +2,15 @@ from pathlib import Path
 import tempfile
 
 from dqc_container import parse_dqc_text, prepare_chunk_text_for_run, render_dqc_text
-from split import clear_directory_contents, compute_chunk_flows, format_flow_lines_html, line_is_inside_blocking_scope
+from split import (
+    clear_directory_contents,
+    compute_chunk_flows,
+    dqc_display_split_before_lines,
+    dqc_display_split_before_to_raw_split_after_lines,
+    format_flow_lines_html,
+    line_is_inside_blocking_scope,
+    normalize_dqc_clicked_split_line,
+)
 from openqasm3 import parse
 
 
@@ -37,6 +45,31 @@ def test_render_dqc_text_roundtrips_chunks_and_pragmas():
     assert document.chunks[1].text == "line 2\n"
     assert document.chunks[2].text == "line 3\n"
     assert document.pragma_line_numbers == {2, 4}
+
+
+def test_dqc_display_split_before_lines_and_conversion_are_split_before_semantics():
+    raw_text = "line 1\nline 2\nline 3\n"
+    dqc_text = render_dqc_text(raw_text, {1, 2})
+    document = parse_dqc_text(dqc_text)
+
+    # pragma lines are {2, 4}, but user-visible split markers should be on the
+    # first line of each next chunk: lines 3 and 5 in display text.
+    assert dqc_display_split_before_lines(document) == {3, 5}
+
+    # Converting those markers back to raw split-after lines should round-trip.
+    assert dqc_display_split_before_to_raw_split_after_lines(document, {3, 5}) == {1, 2}
+
+
+def test_normalize_dqc_clicked_split_line_maps_pragma_to_same_split_marker():
+    raw_text = "line 1\nline 2\nline 3\n"
+    dqc_text = render_dqc_text(raw_text, {1, 2})
+
+    # Pragmas are at lines 2 and 4. They should map to split markers at 3 and 5.
+    assert normalize_dqc_clicked_split_line(dqc_text, 2) == 3
+    assert normalize_dqc_clicked_split_line(dqc_text, 4) == 5
+    # Clicking directly on marker lines remains unchanged.
+    assert normalize_dqc_clicked_split_line(dqc_text, 3) == 3
+    assert normalize_dqc_clicked_split_line(dqc_text, 5) == 5
 
 
 def test_prepare_chunk_text_for_run_preserves_openqasm_3_1_header():

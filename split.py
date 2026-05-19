@@ -55,7 +55,6 @@ except Exception:
     from qasm_rewriter import transpile_qasm as transpile_for_split
 from dqc_container import (
     DqcDocument,
-    display_split_lines_to_raw_split_after_lines,
     is_dqc_pragma_line,
     parse_dqc_text,
     prepare_chunk_text_for_run,
@@ -539,6 +538,50 @@ def collect_qubit_register_names(circuit: Any) -> set[str]:
     return names
 
 
+def dqc_display_split_before_lines(document: DqcDocument) -> set[int]:
+    """Return display line numbers that mark the first line of a next chunk.
+
+    In DQC text, split boundaries are represented by pragma lines inserted
+    between chunks. The user-facing split marker should be on the first source
+    line *after* each pragma, so right-click semantics are "split before line".
+    """
+    display_line_count = len(document.source_text.splitlines())
+    return {
+        pragma_line + 1
+        for pragma_line in document.pragma_line_numbers
+        if pragma_line + 1 <= display_line_count
+    }
+
+
+def dqc_display_split_before_to_raw_split_after_lines(document: DqcDocument, split_before_lines: set[int]) -> set[int]:
+    """Convert display split-before lines into raw split-after line numbers."""
+    raw_split_after_lines: set[int] = set()
+    for line in split_before_lines:
+        raw_after_for_line = document.display_to_raw_after_line.get(line)
+        if raw_after_for_line is None:
+            continue
+        raw_split_after = raw_after_for_line - 1
+        if raw_split_after > 0:
+            raw_split_after_lines.add(raw_split_after)
+    return raw_split_after_lines
+
+
+def normalize_dqc_clicked_split_line(source_text: str, clicked_line: int) -> int:
+    """Normalize a clicked display line in DQC mode to the split marker line.
+
+    In DQC text, each split is represented by a pragma line immediately before
+    the first line of the next chunk. The editor highlights that first chunk
+    line as the split marker. This helper maps clicks on either location to the
+    same split-marker line, so both clicks toggle the same split.
+    """
+    document = parse_dqc_text(source_text)
+    if clicked_line in document.pragma_line_numbers:
+        candidate = clicked_line + 1
+        if candidate <= len(source_text.splitlines()):
+            return candidate
+    return clicked_line
+
+
 class ChunkDagView(QGraphicsView):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -939,11 +982,19 @@ class CodeEditor(QPlainTextEdit):
         cursor = self.cursorForPosition(pos)
         line = cursor.blockNumber() + 1  # Convert to 1-indexed
 
+        # In DQC mode, a split can be clicked either on the highlighted marker
+        # line or on its preceding pragma line. Treat both as the same toggle.
+        window = cast("SplitWindow", self.window())
+        try:
+            if isinstance(window, SplitWindow) and window.current_dqc_document is not None:
+                line = normalize_dqc_clicked_split_line(self.toPlainText(), line)
+        except Exception:
+            pass
+
         if line in self.split_points:
             self.remove_split_point(line)
         else:
             # Verify that a split at this line is allowed (top-level only)
-            window = cast("SplitWindow", self.window())
             try:
                 allowed = True if not hasattr(window, "is_line_splittable") else window.is_line_splittable(line)
             except Exception:
@@ -1255,7 +1306,7 @@ class SplitWindow(QMainWindow):
                 pass
 
             self.editor.setPlainText(text)
-            self.editor.split_points = set(document.pragma_line_numbers)
+            self.editor.split_points = dqc_display_split_before_lines(document)
             self.editor.line_number_area.update()
             apply_gray_line_numbers(self.editor, document.pragma_line_numbers)
 
@@ -1478,7 +1529,7 @@ class SplitWindow(QMainWindow):
 
         document = parse_dqc_text(self.editor.toPlainText())
         raw_text = document.raw_text
-        raw_split_after_lines = display_split_lines_to_raw_split_after_lines(
+        raw_split_after_lines = dqc_display_split_before_to_raw_split_after_lines(
             document,
             self.editor.split_points | {line},
         )
@@ -1486,7 +1537,7 @@ class SplitWindow(QMainWindow):
         updated = parse_dqc_text(dqc_text)
         self.current_dqc_document = updated
         self.editor.setPlainText(updated.source_text)
-        self.editor.split_points = set(updated.pragma_line_numbers)
+        self.editor.split_points = dqc_display_split_before_lines(updated)
         self.editor.line_number_area.update()
         apply_gray_line_numbers(self.editor, updated.pragma_line_numbers)
         self.refresh_chunk_view()
@@ -1500,7 +1551,7 @@ class SplitWindow(QMainWindow):
 
         document = parse_dqc_text(self.editor.toPlainText())
         raw_text = document.raw_text
-        raw_split_after_lines = display_split_lines_to_raw_split_after_lines(
+        raw_split_after_lines = dqc_display_split_before_to_raw_split_after_lines(
             document,
             {split_line for split_line in self.editor.split_points if split_line != line},
         )
@@ -1508,7 +1559,7 @@ class SplitWindow(QMainWindow):
         updated = parse_dqc_text(dqc_text)
         self.current_dqc_document = updated
         self.editor.setPlainText(updated.source_text)
-        self.editor.split_points = set(updated.pragma_line_numbers)
+        self.editor.split_points = dqc_display_split_before_lines(updated)
         self.editor.line_number_area.update()
         apply_gray_line_numbers(self.editor, updated.pragma_line_numbers)
         self.refresh_chunk_view()
@@ -1546,7 +1597,7 @@ class SplitWindow(QMainWindow):
         self.current_dqc_file = dqc_file
         self.current_dqc_document = parse_dqc_text(dqc_text)
         self.editor.setPlainText(self.current_dqc_document.source_text)
-        self.editor.split_points = set(self.current_dqc_document.pragma_line_numbers)
+        self.editor.split_points = dqc_display_split_before_lines(self.current_dqc_document)
         self.editor.line_number_area.update()
         apply_gray_line_numbers(self.editor, self.current_dqc_document.pragma_line_numbers)
 
