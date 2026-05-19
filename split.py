@@ -1283,7 +1283,8 @@ class SplitWindow(QMainWindow):
             apply_gray_line_numbers(self.editor, set())
             self.refresh_chunk_view()
             self.split_button.setEnabled(True)
-            self.run_button.setEnabled(False)
+            # Running live/unsaved chunks from QASM is supported by run_chunks.
+            self.run_button.setEnabled(True)
             self.status_label.setText(f"Loaded {path.name}")
             self.setWindowTitle(f"QASM3 Splitter - {path.resolve()}")
         except Exception as exc:
