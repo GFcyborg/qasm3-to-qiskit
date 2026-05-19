@@ -1048,7 +1048,6 @@ class SplitWindow(QMainWindow):
             QMessageBox.critical(self, "Launch failed", f"Failed to launch run.py: {exc}")
             return
 
-        self.current_dqc_file = None
         self.status_label.setText(f"Launched run.py with {len(chunks)} chunks")
 
 
