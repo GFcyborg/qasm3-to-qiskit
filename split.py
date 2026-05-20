@@ -551,8 +551,10 @@ def collect_multi_qubit_interactions(circuit: Any) -> tuple[list[Any], dict[tupl
             continue
 
         gate_name = getattr(node, "name", "op") or "op"
-        for qubit_a, qubit_b in combinations(sorted(qargs, key=index_by_qubit.get), 2):
-            key = tuple(sorted((index_by_qubit[qubit_a], index_by_qubit[qubit_b])))
+        for qubit_a, qubit_b in combinations(sorted(qargs, key=lambda qubit: index_by_qubit[qubit]), 2):
+            left_index = index_by_qubit[qubit_a]
+            right_index = index_by_qubit[qubit_b]
+            key: tuple[int, int] = (left_index, right_index) if left_index <= right_index else (right_index, left_index)
             edge = interactions.setdefault(key, {"count": 0, "gates": set()})
             edge["count"] += 1
             edge["gates"].add(gate_name)
@@ -1005,19 +1007,19 @@ class MultiQubitInteractionView(QiskitDagView):
 
         node_font = QFont(font)
         if node_font.pointSizeF() > 0:
-            node_font.setPointSizeF(max(7.0, node_font.pointSizeF() - 2.0))
+            node_font.setPointSizeF(max(11.0, node_font.pointSizeF()))
         elif node_font.pointSize() > 0:
-            node_font.setPointSize(max(7, node_font.pointSize() - 2))
+            node_font.setPointSize(max(11, node_font.pointSize()))
         else:
-            node_font.setPointSize(8)
+            node_font.setPointSize(11)
 
         edge_font = QFont(font)
         if edge_font.pointSizeF() > 0:
-            edge_font.setPointSizeF(max(6.0, edge_font.pointSizeF() - 3.0))
+            edge_font.setPointSizeF(max(11.0, edge_font.pointSizeF()))
         elif edge_font.pointSize() > 0:
-            edge_font.setPointSize(max(6, edge_font.pointSize() - 3))
+            edge_font.setPointSize(max(11, edge_font.pointSize()))
         else:
-            edge_font.setPointSize(7)
+            edge_font.setPointSize(11)
 
         center_x = 0.0
         center_y = 0.0
@@ -1036,20 +1038,21 @@ class MultiQubitInteractionView(QiskitDagView):
                 y - node_radius,
                 node_radius * 2.0,
                 node_radius * 2.0,
-                QPen(QColor("#aa5a00")),
-                QBrush(QColor("#fff1df")),
+                QPen(QColor("#2b8a3e")),
+                QBrush(QColor("#e7f7ea")),
             )
             node.setZValue(3)
 
             label = scene.addSimpleText(wire_label(qubit))
             label.setFont(node_font)
-            label.setBrush(QBrush(QColor("#4a2a00")))
+            label.setBrush(QBrush(QColor("#1f5f2d")))
             label_rect = label.boundingRect()
             label.setPos(x - label_rect.width() / 2, y + node_radius + 4.0)
             label.setZValue(4)
 
         max_count = max(int(edge["count"]) for edge in interactions.values())
-        edge_base_color = QColor("#cc6a00")
+        edge_base_color = QColor("#2b8a3e")
+        edge_base_color.setAlpha(120)
 
         for (left_index, right_index), edge in sorted(interactions.items()):
             qubit_left = qubits[left_index]
@@ -1063,7 +1066,7 @@ class MultiQubitInteractionView(QiskitDagView):
             if len(gates) > 3:
                 gate_text += ", ..."
 
-            weight = 1.2 + (3.5 * count / max(1, max_count))
+            weight = 0.7 + (1.5 * count / max(1, max_count))
             edge_pen = QPen(edge_base_color)
             edge_pen.setWidthF(weight)
 
