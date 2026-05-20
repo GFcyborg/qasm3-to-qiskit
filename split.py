@@ -14,6 +14,7 @@ import json
 import shutil
 import math
 import time
+from itertools import combinations
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, cast
@@ -538,6 +539,27 @@ def collect_qubit_register_names(circuit: Any) -> set[str]:
     return names
 
 
+def collect_multi_qubit_interactions(circuit: Any) -> tuple[list[Any], dict[tuple[int, int], dict[str, Any]]]:
+    dag = circuit_to_dag(circuit)
+    qubits = list(getattr(dag, "qubits", []) or [])
+    index_by_qubit = {qubit: index for index, qubit in enumerate(qubits)}
+    interactions: dict[tuple[int, int], dict[str, Any]] = {}
+
+    for node in dag.topological_op_nodes():
+        qargs = [qubit for qubit in getattr(node, "qargs", []) or [] if qubit in index_by_qubit]
+        if len(qargs) < 2:
+            continue
+
+        gate_name = getattr(node, "name", "op") or "op"
+        for qubit_a, qubit_b in combinations(sorted(qargs, key=index_by_qubit.get), 2):
+            key = tuple(sorted((index_by_qubit[qubit_a], index_by_qubit[qubit_b])))
+            edge = interactions.setdefault(key, {"count": 0, "gates": set()})
+            edge["count"] += 1
+            edge["gates"].add(gate_name)
+
+    return qubits, interactions
+
+
 def dqc_display_split_before_lines(document: DqcDocument) -> set[int]:
     """Return display line numbers that mark the first line of a next chunk.
 
@@ -960,6 +982,112 @@ class QiskitDagView(QGraphicsView):
         self._user_interacted = True
 
 
+class MultiQubitInteractionView(QiskitDagView):
+    def set_circuit(self, circuit: Any, font: QFont) -> None:
+        scene = self.scene()
+        if scene is None:
+            scene = QGraphicsScene(self)
+            self.setScene(scene)
+        scene.clear()
+
+        try:
+            qubits, interactions = collect_multi_qubit_interactions(circuit)
+        except Exception as exc:
+            self.set_message(f"Qubit interaction graph unavailable: {exc}", font)
+            return
+
+        if not qubits:
+            self.set_message("No qubits available for interaction graph rendering", font)
+            return
+        if not interactions:
+            self.set_message("No multi-qubit interactions available", font)
+            return
+
+        node_font = QFont(font)
+        if node_font.pointSizeF() > 0:
+            node_font.setPointSizeF(max(7.0, node_font.pointSizeF() - 2.0))
+        elif node_font.pointSize() > 0:
+            node_font.setPointSize(max(7, node_font.pointSize() - 2))
+        else:
+            node_font.setPointSize(8)
+
+        edge_font = QFont(font)
+        if edge_font.pointSizeF() > 0:
+            edge_font.setPointSizeF(max(6.0, edge_font.pointSizeF() - 3.0))
+        elif edge_font.pointSize() > 0:
+            edge_font.setPointSize(max(6, edge_font.pointSize() - 3))
+        else:
+            edge_font.setPointSize(7)
+
+        center_x = 0.0
+        center_y = 0.0
+        radius = max(140.0, 42.0 * len(qubits))
+        node_radius = 14.0
+
+        node_positions: dict[Any, tuple[float, float]] = {}
+        for index, qubit in enumerate(qubits):
+            angle = (-math.pi / 2.0) + (2.0 * math.pi * index / max(1, len(qubits)))
+            x = center_x + radius * math.cos(angle)
+            y = center_y + radius * math.sin(angle)
+            node_positions[qubit] = (x, y)
+
+            node = scene.addEllipse(
+                x - node_radius,
+                y - node_radius,
+                node_radius * 2.0,
+                node_radius * 2.0,
+                QPen(QColor("#aa5a00")),
+                QBrush(QColor("#fff1df")),
+            )
+            node.setZValue(3)
+
+            label = scene.addSimpleText(wire_label(qubit))
+            label.setFont(node_font)
+            label.setBrush(QBrush(QColor("#4a2a00")))
+            label_rect = label.boundingRect()
+            label.setPos(x - label_rect.width() / 2, y + node_radius + 4.0)
+            label.setZValue(4)
+
+        max_count = max(int(edge["count"]) for edge in interactions.values())
+        edge_base_color = QColor("#cc6a00")
+
+        for (left_index, right_index), edge in sorted(interactions.items()):
+            qubit_left = qubits[left_index]
+            qubit_right = qubits[right_index]
+            start_x, start_y = node_positions[qubit_left]
+            end_x, end_y = node_positions[qubit_right]
+
+            count = int(edge["count"])
+            gates = sorted(edge["gates"])
+            gate_text = ", ".join(gates[:3])
+            if len(gates) > 3:
+                gate_text += ", ..."
+
+            weight = 1.2 + (3.5 * count / max(1, max_count))
+            edge_pen = QPen(edge_base_color)
+            edge_pen.setWidthF(weight)
+
+            line = QGraphicsLineItem(start_x, start_y, end_x, end_y)
+            line.setPen(edge_pen)
+            scene.addItem(line)
+
+            label = scene.addSimpleText(f"{count}x\n{gate_text}" if gate_text else f"{count}x")
+            label.setFont(edge_font)
+            label.setBrush(QBrush(edge_base_color))
+            label_rect = label.boundingRect().adjusted(-6, -4, 6, 4)
+            midpoint_x = (start_x + end_x) / 2.0
+            midpoint_y = (start_y + end_y) / 2.0
+            label.setPos(midpoint_x - label_rect.width() / 2.0, midpoint_y - label_rect.height() / 2.0)
+            label.setZValue(5)
+
+        scene.setSceneRect(scene.itemsBoundingRect().adjusted(-30, -30, 30, 30))
+        self._user_interacted = False
+        self._last_user_interaction = 0.0
+        self.resetTransform()
+        self.fitInView(scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        self.centerOn(scene.sceneRect().center())
+
+
 class CodeEditor(QPlainTextEdit):
     """Read-only QASM editor with line numbers and split point markers."""
     
@@ -1111,11 +1239,14 @@ class SplitWindow(QMainWindow):
         editor_panel, _ = self.make_titled_panel("QASM original (right-click to toggle split)", "#d8ecff", self.editor)
 
         self.qiskit_dag_view = QiskitDagView()
+        self.qubit_interaction_view = MultiQubitInteractionView()
         self.flow_graph_view = ChunkDagView()
         self.qiskit_dag_view.setMinimumHeight(180)
+        self.qubit_interaction_view.setMinimumHeight(180)
         self.flow_graph_view.setMinimumHeight(180)
         self.dag_tabs = QTabWidget()
         self.dag_tabs.addTab(self.qiskit_dag_view, "Overall DAG")
+        self.dag_tabs.addTab(self.qubit_interaction_view, "Qubit Interaction")
         self.dag_tabs.addTab(self.flow_graph_view, "Chunk dependencies")
         self.dag_tabs.setCurrentIndex(0)
         dag_panel, _ = self.make_titled_panel("DAG views", "#dbeed8", self.dag_tabs)
@@ -1161,6 +1292,7 @@ class SplitWindow(QMainWindow):
         self.build_toolbar()
         self.build_menu()
         self.apply_font()
+        self.load_default()
 
     def make_titled_panel(self, title: str, color: str, content: QWidget) -> tuple[QWidget, QLabel]:
         panel = QWidget()
@@ -1246,7 +1378,7 @@ class SplitWindow(QMainWindow):
 
     def apply_font(self) -> None:
         font = QFont("DejaVu Sans Mono", self.font_size)
-        for widget in (self.editor, self.rewritten_chunk_view, self.chunk_tabs, self.dag_tabs, self.qiskit_dag_view, self.flow_graph_view):
+        for widget in (self.editor, self.rewritten_chunk_view, self.chunk_tabs, self.dag_tabs, self.qiskit_dag_view, self.qubit_interaction_view, self.flow_graph_view):
             widget.setFont(font)
 
     def set_font_size(self, size: int) -> None:
@@ -1260,6 +1392,11 @@ class SplitWindow(QMainWindow):
         )
         if name:
             self.load_file(Path(name))
+
+    def load_default(self) -> None:
+        default = EXAMPLES / "adder.qasm"
+        if default.exists():
+            self.load_file(default)
 
     def load_file(self, path: Path) -> None:
         if path.suffix.lower() == ".dqc":
@@ -1425,9 +1562,11 @@ class SplitWindow(QMainWindow):
             rewritten, _, _ = transpile_for_split(source_text)
             circuit = qiskit_parse(rewritten)
             self.qiskit_dag_view.set_circuit(circuit, font)
+            self.qubit_interaction_view.set_circuit(circuit, font)
             self.chunk_dependency_qubits = collect_qubit_register_names(circuit)
         except Exception as exc:
             self.qiskit_dag_view.set_message(f"Qiskit DAG unavailable: {exc}", font)
+            self.qubit_interaction_view.set_message(f"Qubit interaction graph unavailable: {exc}", font)
             self.chunk_dependency_qubits = set()
 
         flows = compute_chunk_flows([original for _, original, _ in chunks], source_text)
@@ -1630,22 +1769,14 @@ class SplitWindow(QMainWindow):
             chunks: list[tuple[str,str]] = []
             for chunk in document.chunks:
                 chunk_for_run = prepare_chunk_text_for_run(chunk.text, document.raw_text)
-                try:
-                    rewritten, _, _ = transpile_for_split(chunk_for_run)
-                except Exception:
-                    rewritten = chunk_for_run
-                chunks.append((f"Chunk {chunk.index}", rewritten))
+                chunks.append((f"Chunk {chunk.index}", chunk_for_run))
         else:
             original_text = self.editor.toPlainText()
             piece_texts = self.extract_chunks_by_lines(original_text, set(self.editor.split_points))
             chunks = []
             for i, text in enumerate(piece_texts, 1):
                 chunk_for_run = prepare_chunk_text_for_run(text, original_text)
-                try:
-                    rewritten, _, _ = transpile_for_split(chunk_for_run)
-                except Exception:
-                    rewritten = chunk_for_run
-                chunks.append((f"Chunk {i}", rewritten))
+                chunks.append((f"Chunk {i}", chunk_for_run))
 
         try:
             script = ROOT / "run.py"
